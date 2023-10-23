@@ -1,0 +1,4 @@
+# don't upload blend file for now
+*.blend
+*.blend1
+blender_assets*
