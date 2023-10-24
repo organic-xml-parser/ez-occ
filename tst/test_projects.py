@@ -14,12 +14,12 @@ import OCC.Core.TopOpeBRepBuild
 import OCC.Core.gp as gp
 import OCC.Core.TopAbs
 
-import pythonoccutils.occutils_python as op
-from pythonoccutils.humanization import Humanize
-from pythonoccutils.part_manager import PartFactory, Part, NoOpCacheToken, NoOpPartCache
-from pythonoccutils.precision import Compare
-from pythonoccutils.subshape_mapping import SubshapeMap
-from pythonoccutils.type_utils import TypeValidator
+import ezocc.occutils_python as op
+from ezocc.humanization import Humanize
+from ezocc.part_manager import PartFactory, Part, NoOpCacheToken, NoOpPartCache
+from ezocc.precision import Compare
+from ezocc.subshape_mapping import SubshapeMap
+from ezocc.type_utils import TypeValidator
 
 
 class TestProjects(unittest.TestCase):

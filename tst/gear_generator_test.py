@@ -20,9 +20,9 @@ import OCC.Core.gp as gp
 from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.gp import gp_Vec
 
-import pythonoccutils.occutils_python as op
-from pythonoccutils.gears.gear_generator import InvoluteGearFactory, GearSpec, GearPairSpec
-from pythonoccutils.part_manager import Part, PartFactory, NoOpPartCache
+import ezocc.occutils_python as op
+from ezocc.gears.gear_generator import InvoluteGearFactory, GearSpec, GearPairSpec
+from ezocc.part_manager import Part, PartFactory, NoOpPartCache
 
 
 class GearGeneratorTest(unittest.TestCase):

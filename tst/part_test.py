@@ -20,13 +20,13 @@ import OCC.Core.gp as gp
 from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.gp import gp_Vec
 
-import pythonoccutils.occutils_python as op
-from pythonoccutils.part_cache import InMemoryPartCache
-from pythonoccutils.part_manager import Part, PartFactory, NoOpPartCache, CacheToken, NoOpCacheToken
+import ezocc.occutils_python as op
+from ezocc.part_cache import InMemoryPartCache
+from ezocc.part_manager import Part, PartFactory, NoOpPartCache, CacheToken, NoOpCacheToken
 
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
 
-from pythonoccutils.subshape_mapping import SubshapeMap
+from ezocc.subshape_mapping import SubshapeMap
 
 
 class TestPart(unittest.TestCase):
@@ -50,7 +50,7 @@ class TestPart(unittest.TestCase):
             self.assertEqual(p.annotations, {"color": "red"})
 
     def test_root_part(self):
-        shp = OCC.Core.TopoDS.TopoDS_Vertex()
+        shp = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeVertex(gp.gp_Pnt(0, 0, 0)).Shape()
         self.assertEqual(
             Part(NoOpCacheToken(), SubshapeMap.from_single_shape(shp)).shape, shp)
 
@@ -167,7 +167,7 @@ class TestPart(unittest.TestCase):
     def test_part_prune(self):
         mkbox = OCC.Core.BRepPrimAPI.BRepPrimAPI_MakeBox(10, 2, 3)
 
-        orphan_face = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeFace(gp.gp_Pln(gp.gp_Origin(), gp.gp_DZ())).Shape()
+        orphan_face = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeFace(gp.gp_Pln(gp.gp.Origin(), gp.gp.DZ())).Shape()
         pruned_part = Part(NoOpCacheToken(),
                            SubshapeMap.from_unattributed_shapes(mkbox.Shape(), {"front_face": [orphan_face]})).pruned()
 
@@ -243,7 +243,7 @@ class TestPart(unittest.TestCase):
         ]
 
         part = part_factory.loft(
-            [w.shape for w in wires_or_faces],
+            wires_or_faces,
             is_solid=True,
             first_shape_name="bottom",
             loft_profile_name="loft-profile",
@@ -261,3 +261,10 @@ class TestPart(unittest.TestCase):
         self.assertNotEqual(bottom.shape, top.shape)
 
         self.assertTrue(bottom.xts.z_max < top.xts.z_max)
+
+    def test_make_thick_solid(self):
+        part = PartFactory(self._part_cache).box(10, 10, 10)
+
+        extruded = part.extrude.make_thick_solid(1)
+
+        self.assertEqual(extruded.xts.x_span, part.xts.x_span + 2)

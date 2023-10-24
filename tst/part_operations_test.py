@@ -3,8 +3,8 @@ import unittest
 import OCC.Core.TopAbs
 import OCC.Core.TopoDS
 
-from pythonoccutils.humanization import Humanize
-from pythonoccutils.part_manager import NoOpPartCache, PartFactory
+from ezocc.humanization import Humanize
+from ezocc.part_manager import NoOpPartCache, PartFactory
 
 
 class TestPart(unittest.TestCase):

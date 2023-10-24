@@ -2,8 +2,8 @@ import pdb
 import tempfile
 import unittest
 
-from pythonoccutils.part_cache import InMemoryPartCache
-from pythonoccutils.part_manager import NoOpPartCache, PartFactory, PartSave
+from ezocc.part_cache import InMemoryPartCache
+from ezocc.part_manager import NoOpPartCache, PartFactory, PartSave
 
 import util_wrapper_swig
 

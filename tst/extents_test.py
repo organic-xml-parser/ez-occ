@@ -13,7 +13,7 @@ import OCC.Core.ShapeUpgrade
 import OCC.Core.TopOpeBRepBuild
 import OCC.Core.gp as gp
 
-import pythonoccutils.occutils_python as op
+import ezocc.occutils_python as op
 
 
 class TestExtents(unittest.TestCase):

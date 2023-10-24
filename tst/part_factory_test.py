@@ -19,8 +19,8 @@ import OCC.Core.gp as gp
 from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.gp import gp_Vec
 
-import pythonoccutils.occutils_python as op
-from pythonoccutils.part_manager import Part, PartFactory, NoOpPartCache
+import ezocc.occutils_python as op
+from ezocc.part_manager import Part, PartFactory, NoOpPartCache
 
 
 class PartFactoryTest(unittest.TestCase):
@@ -33,7 +33,7 @@ class PartFactoryTest(unittest.TestCase):
         self.assertAlmostEqual(t.extents.x_span, 1)
         self.assertAlmostEqual(t.extents.y_span, 1)
 
-        t = self._factory.right_angle_triangle(10, math.pi / 3, pln=gp.gp_YOZ())
+        t = self._factory.right_angle_triangle(10, math.pi / 3, pln=gp.gp.YOZ())
         self.assertAlmostEqual(t.extents.y_span, 10 * math.cos(math.pi/3))
         self.assertAlmostEqual(t.extents.z_span, 10 * math.sin(math.pi/3))
 

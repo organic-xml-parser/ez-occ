@@ -5,9 +5,9 @@ import unittest
 import OCC.Core.BRep
 import OCC.Core.TopoDS
 
-from pythonoccutils.occutils_python import SetPlaceableShape
-from pythonoccutils.part_cache import InMemoryPartCache
-from pythonoccutils.part_manager import NoOpPartCache, PartFactory, PartSave
+from ezocc.occutils_python import SetPlaceableShape
+from ezocc.part_cache import InMemoryPartCache
+from ezocc.part_manager import NoOpPartCache, PartFactory, PartSave
 
 import util_wrapper_swig
 

@@ -6,8 +6,8 @@ from unittest.mock import MagicMock
 
 import OCC.Core.TopoDS
 
-from pythonoccutils.part_cache import DefaultCacheToken, InMemoryPartCache, FileBasedPartCache
-from pythonoccutils.part_manager import PartFactory, PartSave, CacheToken, PartCache, NoOpPartCache, Part, LazyLoadedPart
+from ezocc.part_cache import DefaultCacheToken, InMemoryPartCache, FileBasedPartCache
+from ezocc.part_manager import PartFactory, PartSave, CacheToken, PartCache, NoOpPartCache, Part, LazyLoadedPart
 
 import util_wrapper_swig
 

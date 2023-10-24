@@ -1,7 +1,6 @@
 [project]
 name = "pythonoccutils"
 version = "0.0.1"
-
 description = "Tools and Utilities intended to work with pythonocc"
 readme = "README.md"
 requires-python = ">=3.7"

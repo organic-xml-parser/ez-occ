@@ -14,8 +14,8 @@ import OCC.Core.ShapeUpgrade
 import OCC.Core.TopOpeBRepBuild
 import OCC.Core.gp as gp
 
-import pythonoccutils.occutils_python as op
-from pythonoccutils.part_manager import PartFactory, NoOpPartCache
+import ezocc.occutils_python as op
+from ezocc.part_manager import PartFactory, NoOpPartCache
 
 
 class BugfixTest(unittest.TestCase):

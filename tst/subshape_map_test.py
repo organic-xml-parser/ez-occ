@@ -20,16 +20,16 @@ import OCC.Core.gp as gp
 from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.gp import gp_Vec
 
-import pythonoccutils.occutils_python as op
-from pythonoccutils.part_cache import InMemoryPartCache
-from pythonoccutils.part_manager import Part, PartFactory, NoOpPartCache, CacheToken, NoOpCacheToken
+import ezocc.occutils_python as op
+from ezocc.part_cache import InMemoryPartCache
+from ezocc.part_manager import Part, PartFactory, NoOpPartCache, CacheToken, NoOpCacheToken
 
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
 from OCC.Core.gp import gp_Pnt
 
 import OCC.Core.BRep
 
-from pythonoccutils.subshape_mapping import SubshapeMap, AnnotatedShape
+from ezocc.subshape_mapping import SubshapeMap, AnnotatedShape
 
 
 class TestSubshapeMap(unittest.TestCase):

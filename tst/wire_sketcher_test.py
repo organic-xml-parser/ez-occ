@@ -4,8 +4,8 @@ import unittest
 import OCC.Core.ShapeAnalysis
 import OCC.Core.gp as gp
 
-import pythonoccutils.occutils_python as op
-from pythonoccutils.part_manager import NoOpPartCache
+import ezocc.occutils_python as op
+from ezocc.part_manager import NoOpPartCache
 
 
 class WireSketcherTest(unittest.TestCase):
@@ -117,7 +117,7 @@ class WireSketcherTest(unittest.TestCase):
             self.assertTrue(sae.HasCurve3d(e))
 
         face = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeFace(
-            OCC.Core.gp.gp_Pln(gp.gp_Origin(), gp.gp_DZ())).Face()
+            OCC.Core.gp.gp_Pln(gp.gp.Origin(), gp.gp.DZ())).Face()
 
         saw = OCC.Core.ShapeAnalysis.ShapeAnalysis_Wire(w, face, 0.001)
         self.assertFalse(saw.CheckClosed())

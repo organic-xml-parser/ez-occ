@@ -13,14 +13,17 @@ import OCC.Core.ShapeUpgrade
 import OCC.Core.TopOpeBRepBuild
 import OCC.Core.gp as gp
 
-import pythonoccutils.occutils_python as op
-from pythonoccutils.part_manager import PartFactory, NoOpPartCache
-from pythonoccutils.type_utils import TypeValidator
+import ezocc.occutils_python as op
+from ezocc.part_manager import PartFactory, NoOpPartCache
+from ezocc.type_utils import TypeValidator
 
 class TestTypeUtils(unittest.TestCase):
 
     def setUp(self) -> None:
         self._cache = NoOpPartCache.instance()
+
+    def test_check_vertex(self):
+        TypeValidator.is_any_shape(OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeVertex(gp.gp_Pnt(0, 0, 0)))
 
     def test_check(self):
         part = PartFactory(self._cache).box(10, 10, 10)

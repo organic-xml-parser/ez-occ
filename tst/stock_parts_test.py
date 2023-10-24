@@ -19,12 +19,12 @@ import OCC.Core.gp as gp
 from OCC.Core.TopAbs import TopAbs_FACE
 from OCC.Core.gp import gp_Vec
 
-import pythonoccutils.occutils_python as op
-from pythonoccutils.part_manager import Part, PartFactory, NoOpPartCache
+import ezocc.occutils_python as op
+from ezocc.part_manager import Part, PartFactory, NoOpPartCache
 
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
 
-from pythonoccutils.stock_parts import StockParts
+from ezocc.stock_parts import StockParts
 
 
 class TestPart(unittest.TestCase):
@@ -45,7 +45,7 @@ class TestPart(unittest.TestCase):
         self._stock_parts.switch_momentary(4)
 
     def test_ruler(self):
-        self._stock_parts.ruler()
+        self._stock_parts.ruler(10)
 
     def test_screw_m3(self):
         self._stock_parts.screw_m3(50)

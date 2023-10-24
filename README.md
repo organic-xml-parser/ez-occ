@@ -2,7 +2,35 @@
 
 ## Examples
 
+### Gears
+![screenshot](resources/gears.png)
+
+Parts store a hierarchy of shape data that persists between most operations.
+These labels and attributes can be used to group together parts along with
+their clearances (labelled parts are highlighted).
+
+```python
+def gears(cache):
+    factory = PartFactory(cache)
+    gears = InvoluteGearFactory(cache).create_involute_gear_pair(
+        GearPairSpec.matched_pair(2, 10, 5, clearance=0.5), height=10)
+
+    gears = gears.do_on("pinion", consumer=lambda p: p.tr.rz(math.radians(35), offset=p.sp("center").xts.xyz_mid))
+
+    result = factory.box_surrounding(gears, 3, 3, 1.5).align().by("zmax", gears).bool.cut(
+        *[s.extrude.make_thick_solid(1) for s in gears.list_subpart("clearance")]
+    )
+
+    shaft = factory.cylinder(1, result.xts.z_span).align().by("zmin", result)
+
+    bull = gears.sp("bull", "body").bool.cut(shaft.align().by("xmidymid", gears.sp("bull", "center")))
+    pinion = gears.sp("pinion", "body").bool.cut(shaft.align().by("xmidymid", gears.sp("pinion", "center")))
+
+    return result.add(bull, pinion)
+```
+
 ### To create a bolt
+![screenshot](resources/bolt_m4.png)
 ```python
 
 def bolt_m4(cache: PartCache):
@@ -36,9 +64,9 @@ def bolt_m4(cache: PartCache):
 
     return factory.compound(head, body, thread)
 ```
-![screenshot](resources/bolt_m4.png)
 
 ### Patterning the bolt, and building an enclosure with a shadow line
+![screenshot](resources/enclosure.png)
 ```python
 
 def enclosure(cache: PartCache):
@@ -72,8 +100,106 @@ def enclosure(cache: PartCache):
 
     return factory.arrange(bottom.add(bolt), top.tr.ry(math.radians(180)), spacing=3)
 ```
-![screenshot](resources/enclosure.png)
 
+### Chess Piece
+![screenshot](resources/chess_piece.png)
+```python
+
+from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_MakePipeShell as mps
+
+def chess_piece(cache):
+    factory = PartFactory(cache)
+
+    base = factory.square_centered(20, 20).fillet.fillet2d_verts(1).make.face()
+    top = factory.circle(7).align().com(base).tr.mv(dz=30).make.face()
+    top_outer = top.tr.scale_to_x_span(top.xts.x_span + 5, scale_other_axes=True).align().com(top)
+
+    head = factory.loft([
+        top,
+        top_outer.tr.mv(dz=5),
+        top_outer.tr.mv(dz=10),
+        top_outer.tr.scale_to_x_span(top_outer.xts.x_span - 2, scale_other_axes=True).align().com(top_outer).tr.mv(dz=10),
+        top.tr.mv(dz=5)
+    ], last_shape_name="top_face")
+
+    head = head.bool.cut(
+        factory.box(head.xts.x_span, 1, 1)
+                     .align().by("xminmidymidzmax", head)
+                     .extrude.make_thick_solid(1)
+                     .pattern(range(0, 10), lambda i, p: p.tr.rz(math.radians(i * 360 / 10), offset=head.xts.xyz_mid)))
+
+    m = mps(WireSketcher().line_to(z=30, is_relative=True).get_wire())
+    m.SetMode(factory.helix(30, 10, 0.3).shape, True)
+
+    m.Add(base.make.wire().shape)
+    m.Add(top.make.wire().shape)
+
+    body = factory.shell(*Part.of_shape(m.Shape())
+        .add(base.make.face(), top.make.face()).explore.face.get())\
+        .make.solid()
+
+    base = factory.loft([
+        base,
+        base.tr.scale_to_x_span(base.xts.x_span + 2, scale_other_axes=True).align().com(base).tr.mv(dz=-5),
+        base.tr.scale_to_x_span(base.xts.x_span + 1, scale_other_axes=True).align().com(base).tr.mv(dz=-10)
+    ], last_shape_name="bottom")\
+        .do(lambda f: f.fillet.chamfer_faces(1, f.sp("bottom")))
+
+    return base.add(body, head)
+```
+
+### Parabolic dish with lattice support
+![screenshot](resources/parabolic_dish_1.png)
+![screenshot](resources/parabolic_dish_2.png)
+Note: the lattice boolean operation is fairly slow (~=1m). 
+After caching the script runs on the order of seconds.
+```python
+
+def dish(cache):
+    factory = PartFactory(cache)
+
+    curve = factory.parabola(100, 0, 60)
+
+    inner = curve.sp("curve").revol.about(gp_OZ(), math.radians(360))
+    outer = inner.extrude.make_thick_solid(4)
+
+    rim = factory.loft([
+        inner.explore.edge.get()[1].make.wire(),
+        outer.explore.edge.get()[1].make.wire()
+    ], is_solid=False)
+
+    result = factory.shell(rim.explore.face.get()[0],
+                         *inner.explore.face.get(),
+                         *outer.explore.face.get())\
+        .make.solid().cleanup.fix_solid()
+
+    result_perimeter = factory.cylinder(inner.xts.x_span / 2,
+                                        result.xts.z_span).align().by("xmidymidzmin", result)
+
+    result = result.bool.common(result_perimeter)
+
+    lattice_extrusion_thickness = 0.5
+
+    support_lattice = factory.lattice(9, 9, True, True) \
+        .tr.scale_to_x_span(result.xts.x_span - lattice_extrusion_thickness, scale_other_axes=True) \
+        .do(lambda p: factory.union(*[w.extrude.offset(lattice_extrusion_thickness, spine=gp_XOY()).make.face() for w in p.explore.wire.get()]))\
+        .sew.faces().cleanup()\
+        .align().by("xmidymidzmid", result) \
+        .bool.common(result_perimeter.extrude.make_thick_solid(-2 * lattice_extrusion_thickness)) \
+        .cleanup()\
+        .extrude.prism(dz=result.xts.z_span + 2)\
+        .align().by("zmin", result).tr.mv(dz=-1)\
+        .bool.cut(result).explore.solid.get_min(lambda s: s.xts.z_min)\
+        .bool.cut(factory.box_surrounding(result).align().stack_z0(result))\
+        .add(factory.ring(result_perimeter.xts.x_span / 2, result_perimeter.xts.x_span / 2 - lattice_extrusion_thickness * 2, inner.xts.z_span)
+                    .align().by("xmidymidzmin", result))\
+        .cleanup()
+
+    result = result.cleanup.fix_solid().add(support_lattice)
+
+    return result.bool.cut(factory.box(10, 10, result.xts.z_span).align().by("xmidymidzmin", result))
+
+```
 
 ## Project goals
 

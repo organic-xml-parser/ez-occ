@@ -5,14 +5,19 @@ import uuid
 from unittest.mock import MagicMock
 
 import OCC.Core.TopoDS
+from OCC.Core import gp
 
-from pythonoccutils.gears.gear_generator import GearSpec, GearPairSpec
-from pythonoccutils.part_cache import DefaultCacheToken, InMemoryPartCache, FileBasedPartCache
-from pythonoccutils.part_manager import Part, LazyLoadedPart, NoOpPartCache
+from ezocc.gears.gear_generator import GearSpec, GearPairSpec
+from ezocc.part_cache import DefaultCacheToken, InMemoryPartCache, FileBasedPartCache
+from ezocc.part_manager import Part, LazyLoadedPart, NoOpPartCache
+
+import OCC.Core.BRepBuilderAPI
+
+import OCC.Core.gp
 
 import util_wrapper_swig
 
-from pythonoccutils.subshape_mapping import SubshapeMap
+from ezocc.subshape_mapping import SubshapeMap
 
 
 class TestCacheToken(unittest.TestCase):
@@ -40,7 +45,8 @@ class TestCacheToken(unittest.TestCase):
 
         token = DefaultCacheToken.with_uuid(str(uuid.uuid4()), cache)
 
-        normal_part = Part(token, SubshapeMap.from_unattributed_shapes(OCC.Core.TopoDS.TopoDS_Vertex()))
+        normal_part = Part(token,
+                           SubshapeMap.from_unattributed_shapes(OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeVertex(gp.gp_Pnt(0, 0, 0)).Shape()))
         lazy_part = LazyLoadedPart(token, lambda: normal_part)
         lazy_part_1 = LazyLoadedPart(token, lambda: normal_part)
 
