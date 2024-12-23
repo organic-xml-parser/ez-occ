@@ -1,24 +1,18 @@
+import argparse
 import importlib
 import importlib.resources
 import inspect
 import logging
 import math
 import pdb
-from collections import OrderedDict
-
-import OCC.Core.GCE2d
-import OCC.Core.Geom2d
-import js2py
 import typing
-from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire
-from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_MakePipeShell
-from OCC.Core.Geom import Geom_CylindricalSurface
-from OCC.Core._gp import gp_XOY
-from OCC.Core.gp import gp_Pnt2d, gp_Ax3, gp_OZ, gp_OX
+
+import js2py
+from OCC.Core.gp import gp_Pnt, gp_Vec, gp_Dir, gp_Ax1
 
 import ezocc.gears.gears_js_translated as gear
-from ezocc.occutils_python import WireSketcher
-from ezocc.part_manager import Part, PartFactory, PartCache, NoOpCacheToken
+from ezocc.occutils_python import WireSketcher, InterrogateUtils
+from ezocc.part_manager import Part, PartFactory, PartCache, PartDriver
 from ezocc.svg_parser import SVGPathParser
 
 gear_outline_fn = gear.var.own['createGearOutline']['value']
@@ -44,10 +38,21 @@ class GearMath:
 
 class GearSpec:
 
-    def __init__(self, module: float, num_teeth: int, pressure_angle_deg: float = 20):
+    def __init__(self, module: float,
+                 num_teeth: int,
+                 pressure_angle_deg: float = 20,
+                 preview_mode: bool = False):
+        """
+        @param module:
+        @param num_teeth:
+        @param pressure_angle_deg:
+        @param preview_mode: Since gear generation can be slow due to model complexity, this option allows for an
+        alternative course representation to be produced for the gear body.
+        """
         self.module = module
         self.num_teeth = num_teeth
         self.pressure_angle_deg = pressure_angle_deg
+        self.preview_mode = preview_mode
 
     @property
     def pitch_diameter(self) -> float:
@@ -68,7 +73,8 @@ class GearSpec:
             "pressure_angle_deg": self.pressure_angle_deg,
             "pitch_diameter": self.pitch_diameter,
             "outside_diameter": self.outside_diameter,
-            "root_diameter": self.root_diameter
+            "root_diameter": self.root_diameter,
+            "preview_mode": self.preview_mode
         }
 
 
@@ -83,6 +89,14 @@ class GearPairSpec:
         self.gear_spec_pinion = gear_spec_pinion
         self.center_distance = center_distance
         self.clearance = clearance
+
+    @property
+    def bull_to_pinion_ratio(self) -> float:
+        return self.gear_spec_bull.num_teeth / self.gear_spec_pinion.num_teeth
+
+    @property
+    def pinion_to_bull_ratio(self) -> float:
+        return self.gear_spec_pinion.num_teeth / self.gear_spec_bull.num_teeth
 
     @staticmethod
     def matched_pair(module: float,
@@ -173,11 +187,108 @@ class PlanetaryGearSpec:
         return self._clearance
 
 
+class InvoluteRackFactory:
+    # source: https://khkgears.net/new/gear_knowledge/gear_technical_reference/involute_gear_profile.html
+
+    def __init__(self, cache: PartCache):
+        self._cache = cache
+
+    def create_involute_rack_profile(self, gear_spec: GearSpec):
+
+        token = self._cache.create_token(gear_spec, inspect.getsource(InvoluteRackFactory))
+
+        def _do():
+
+            factory = PartFactory(self._cache)
+
+            root_clearance = 0.25 * gear_spec.module
+
+            period = math.pi * gear_spec.module
+            dedendum_fillet_radius = 0.38 * gear_spec.module
+
+            working_depth = 2 * gear_spec.module
+            tooth_slope_length = working_depth / math.cos(math.radians(gear_spec.pressure_angle_deg))
+            tooth_slope_dx = tooth_slope_length * math.sin(math.radians(gear_spec.pressure_angle_deg))
+
+            tooth_profile = (WireSketcher()
+                             .line_to(x=tooth_slope_dx, y=working_depth, is_relative=True)
+                             .get_wire_part(self._cache)
+                             .do_and_add(lambda p: p.mirror.x(center_x=p.xts.x_mid + period * 0.25)))
+
+            top_verts = (tooth_profile.explore.vertex
+                         .order_by(lambda v: v.xts.y_mid)
+                         .get()[-2:])
+
+            tooth_profile = tooth_profile.add(
+                WireSketcher(*top_verts[0].xts.xyz_mid)
+                    .line_to(*top_verts[1].xts.xyz_mid)
+                .get_wire_part(self._cache))
+
+            dedendum_fillet = (factory.circle_arc(
+                dedendum_fillet_radius,
+                0,
+                -math.radians(90 - gear_spec.pressure_angle_deg)).tr.rz(-math.radians(gear_spec.pressure_angle_deg))
+                               .align().by("xmaxminymaxmin", tooth_profile))
+
+            tooth_profile = tooth_profile.add(
+                dedendum_fillet,
+                dedendum_fillet.mirror.x(center_x=tooth_profile.xts.x_mid)
+            )
+
+            tooth_profile = tooth_profile.add(
+                WireSketcher(tooth_profile.xts.x_min, tooth_profile.xts.y_min, tooth_profile.xts.z_mid)
+                .line_to(x=tooth_profile.xts.x_max)
+                .get_wire_part(self._cache)
+            )
+
+            tooth_profile = (factory.union(*tooth_profile.explore.edge.get())
+                             .make.wire()
+                             .make.face()
+                             .cleanup())
+
+            result = tooth_profile.incremental_pattern(
+                range(0, gear_spec.num_teeth),
+                lambda p: p.tr.mv(dx=period))
+
+            pitch_line = (WireSketcher(result.xts.x_min,
+                                      result.xts.y_min + root_clearance + working_depth / 2,
+                                      result.xts.z_mid)
+                          .line_to(x=result.xts.x_max).get_wire_part(self._cache))
+
+            pitch_perpendicular_line = (WireSketcher(*pitch_line.xts.xyz_mid).line_to(y=1, is_relative=True)
+                                        .get_wire_part(self._cache))
+
+            result = factory.compound(result.name("body"),
+                                      pitch_line.name("pitch_line"),
+                                      pitch_perpendicular_line.name("pitch_perpendicular_line"))
+
+            for k, v in gear_spec.as_dict().items():
+                result = result.annotate(f"gear_spec/{k}", v)
+
+            return result.with_driver(RackDriver).with_cache_token(token)
+
+        return self._cache.ensure_exists(token, _do)
+
+
 class InvoluteGearFactory:
 
     def __init__(self, part_cache: PartCache):
         self._part_cache = part_cache
         self._part_factory = PartFactory(part_cache)
+
+    def _add_gear_local_axes(self, gear: Part, gear_spec: GearSpec) -> Part:
+        if "center" in gear.subshapes.map.keys():
+            raise ValueError("Gear is already annotated with center etc.")
+
+        gear = gear.add(WireSketcher().line_to(0, 0, 1).get_wire_part(self._part_cache).name("rotation_axis"))
+        gear = gear.insert(WireSketcher().line_to(1, 0, 0).get_wire_part(self._part_cache).name("local_x"))
+        gear = gear.insert(WireSketcher().line_to(0, 1, 0).get_wire_part(self._part_cache).name("local_y"))
+        gear = gear.insert(self._part_factory.vertex(0, 0, 0).name("center"))
+
+        for k, v in gear_spec.as_dict().items():
+            gear = gear.annotate(f"gear_spec/{k}", v)
+
+        return gear
 
     def create_int_involute_profile(self, gear_spec: GearSpec) -> Part:
         token = self._part_cache.create_token("involute_gear_factory", "int_involute_profile", gear_spec,
@@ -198,21 +309,25 @@ class InvoluteGearFactory:
 
             result = Part.of_shape(svg_result).make.wire()
 
-            result = result.name("body").add(self._part_factory.vertex(0, 0, 0, "center"))
+            result = result.name("body")
 
-            for k, v in gear_spec.as_dict().items():
-                result = result.annotate(f"gear_spec/{k}", v)
-
-            return result.with_cache_token(token)
+            return self._add_gear_local_axes(result, gear_spec).with_cache_token(token)
 
         return self._part_cache.ensure_exists(token, _do)
 
     def create_involute_profile(self, gear_spec: GearSpec) -> Part:
 
-        token = self._part_cache.create_token("involute_gear_factory", "involute_profile", gear_spec,
+        token = self._part_cache.create_token("involute_gear_factory",
+                                              "involute_profile",
+                                              gear_spec,
                                               inspect.getsource(InvoluteGearFactory))
 
         def _do():
+            if gear_spec.preview_mode:
+                return self._part_factory.polygon(gear_spec.pitch_diameter / 2, gear_spec.num_teeth).sp("body") \
+                    .do(lambda p: self._add_gear_local_axes(p, gear_spec)) \
+                    .with_cache_token(token)
+
             logger.info("Generating gear...")
             gear_result = gear_outline_fn(gear_spec.module, gear_spec.num_teeth, gear_spec.pressure_angle_deg)
 
@@ -225,12 +340,9 @@ class InvoluteGearFactory:
 
             result = Part.of_shape(wire).explore.wire.get()[0]
 
-            result = result.name("body").add(self._part_factory.vertex(0, 0, 0, "center"))
+            result = result.name("body")
 
-            for k, v in gear_spec.as_dict().items():
-                result = result.annotate(f"gear_spec/{k}", v)
-
-            return result.with_cache_token(token)
+            return self._add_gear_local_axes(result, gear_spec).with_driver(GearDriver).with_cache_token(token)
 
         return self._part_cache.ensure_exists(token, _do)
 
@@ -242,8 +354,9 @@ class InvoluteGearFactory:
                                               inspect.getsource(InvoluteGearFactory))
 
         def _do():
-            return self.create_involute_profile(gear_spec).sp("body").make.face().extrude.prism(dz=height)\
-                .add(self._part_factory.vertex(0, 0, 0, "center"))\
+            return self._add_gear_local_axes(
+                self.create_involute_profile(gear_spec).sp("body").make.face().extrude.prism(dz=height), gear_spec) \
+                .with_driver(GearDriver) \
                 .with_cache_token(token)
 
         return self._part_cache.ensure_exists(token, _do)
@@ -298,21 +411,19 @@ class InvoluteGearFactory:
         def _do():
             bull = self.create_involute_profile(gear_pair_spec.gear_spec_bull).sp("body").make.face().extrude.prism(dz=height).make.solid()\
                 .name("body")\
-                .add(
-                    self._part_factory.vertex(0, 0, 0, "center"),
-                    self._part_factory.cylinder(gear_pair_spec.gear_spec_bull.outside_diameter / 2, height).name("clearance"))
+                .do(lambda p: self._add_gear_local_axes(p, gear_pair_spec.gear_spec_bull))\
+                .insert(self._part_factory.cylinder(gear_pair_spec.gear_spec_bull.outside_diameter / 2, height).name("clearance"))
 
             pinion = self.create_involute_profile(gear_pair_spec.gear_spec_pinion).sp("body").make.face().extrude.prism(dz=height).make.solid()\
                 .name("body")\
-                .add(
-                    self._part_factory.vertex(0, 0, 0, "center"),
-                    self._part_factory.cylinder(gear_pair_spec.gear_spec_pinion.outside_diameter / 2, height).name("clearance"))\
+                .do(lambda p: self._add_gear_local_axes(p, gear_pair_spec.gear_spec_pinion))\
+                .insert(self._part_factory.cylinder(gear_pair_spec.gear_spec_pinion.outside_diameter / 2, height).name("clearance"))\
                 .tr.rz(math.radians(360 / (2.0 * gear_pair_spec.gear_spec_pinion.num_teeth)))\
                 .tr.mv(dx=0.5 * (gear_pair_spec.gear_spec_pinion.pitch_diameter + gear_pair_spec.gear_spec_bull.pitch_diameter + gear_pair_spec.clearance))
 
             return self._part_factory.compound(
-                bull.name("bull"),
-                pinion.name("pinion")).with_cache_token(token)
+                bull.with_driver(GearDriver).name("bull"),
+                pinion.with_driver(GearDriver).name("pinion")).with_cache_token(token)
 
         return self._part_cache.ensure_exists(token, _do)
 
@@ -338,7 +449,9 @@ class InvoluteGearFactory:
             return self._part_factory.loft([
                 base_profile,
                 top_profile.tr.mv(dz=height)
-            ]).with_cache_token(token)
+            ])\
+                .do(lambda p: self._add_gear_local_axes(p, gear_spec))\
+                .with_driver(GearDriver).with_cache_token(token)
 
         return self._part_cache.ensure_exists(token, _do)
 
@@ -391,13 +504,11 @@ class InvoluteGearFactory:
             #                               math.sin(bevel_angle_pinion) * hypot_length)
 
             bull = bull.name("body").add(
-                self._part_factory.vertex(0, 0, 0, "center"),
                 self._part_factory.cone(gear_pair_spec.gear_spec_bull.outside_diameter / 2,
                                         gear_pair_spec.gear_spec_bull.outside_diameter * scale_factor_bull / 2,
                                         hypot_length * math.sin(bevel_angle_bull)).name("clearance"))
 
             pinion = pinion.name("body").add(
-                self._part_factory.vertex(0, 0, 0, "center"),
                 self._part_factory.cone(gear_pair_spec.gear_spec_pinion.outside_diameter / 2,
                                         gear_pair_spec.gear_spec_pinion.outside_diameter * scale_factor_bull / 2,
                                         hypot_length * math.sin(bevel_angle_pinion)).name("clearance"))
@@ -413,8 +524,52 @@ class InvoluteGearFactory:
             pinion = pinion.tr.ry(math.radians(-180) + (bevel_angle_pinion + bevel_angle_bull),
                                   offset=((target_module_bull * gear_pair_spec.gear_spec_bull.num_teeth / 2 + gear_pair_spec.clearance / 2), 0, bull.xts.z_max))
 
-            return self._part_factory.compound(bull.name("bull"), pinion.name("pinion"))\
+            return self._part_factory.compound(
+                bull.with_driver(GearDriver).name("bull"),
+                pinion.with_driver(GearDriver).name("pinion"))\
                 .with_cache_token(token)
+
+        return self._part_cache.ensure_exists(token, _do)
+
+    def create_herringbone_gear_pair(self,
+                                     gear_pair_spec: GearPairSpec,
+                                     height: float,
+                                     helix_angle_deg: float = 45,
+                                     chamfer: typing.Optional[float] = None,
+                                     sweep_sense: bool = True,
+                                     make_solid: bool = True):
+
+        token = self._part_cache.create_token("involute_gear_factory", "create_herringbone_gear_pair",
+                                              gear_pair_spec,
+                                              height,
+                                              sweep_sense,
+                                              helix_angle_deg,
+                                              chamfer,
+                                              make_solid,
+                                              inspect.getsource(InvoluteGearFactory))
+
+        def _do():
+
+            pinion = self.create_herringbone_gear(gear_pair_spec.gear_spec_pinion,
+                                                  height=height,
+                                                  sweep_sense=sweep_sense,
+                                                  helix_angle_deg=helix_angle_deg,
+                                                  chamfer=chamfer,
+                                                  make_solid=make_solid)
+
+            bull = self.create_herringbone_gear(gear_pair_spec.gear_spec_bull,
+                                                  height=height,
+                                                  sweep_sense=not sweep_sense,
+                                                  helix_angle_deg=helix_angle_deg,
+                                                  chamfer=chamfer,
+                                                  make_solid=make_solid)
+
+            pinion = pinion.tr.rz(math.radians(360 / (2.0 * gear_pair_spec.gear_spec_pinion.num_teeth)))\
+                .tr.mv(dx=0.5 * (gear_pair_spec.gear_spec_pinion.pitch_diameter + gear_pair_spec.gear_spec_bull.pitch_diameter + gear_pair_spec.clearance))
+
+            return self._part_factory.compound(
+                bull.with_driver(GearDriver).name("bull"),
+                pinion.with_driver(GearDriver).name("pinion")).with_cache_token(token)
 
         return self._part_cache.ensure_exists(token, _do)
 
@@ -425,7 +580,6 @@ class InvoluteGearFactory:
             sweep_sense: bool = True,
             helix_angle_deg: float = 45,
             chamfer: typing.Optional[float] = None,
-            sweep_cycles: int = 1,
             make_solid: bool = True):
 
         token = self._part_cache.create_token("involute_gear_factory", "create_herringbone_gear",
@@ -434,69 +588,204 @@ class InvoluteGearFactory:
                                               sweep_sense,
                                               helix_angle_deg,
                                               chamfer,
-                                              sweep_cycles,
                                               make_solid,
                                               inspect.getsource(InvoluteGearFactory))
+
+        def extrude_gear_profile(gear: Part, sense: bool) -> Part:
+            gear = gear.make.face()
+
+            pitch_dia = gear_spec.pitch_diameter
+
+            helix = self._part_factory.helix_by_angle(
+                height / 2,
+                pitch_dia,
+                helix_angle=math.radians(45 if sense else -45))
+            helix = helix.add(helix.mirror.z().align().stack_z0(helix))\
+                .bool.union()\
+                .cleanup(concat_b_splines=True)\
+                .cleanup.fuse_wires()\
+                .print()\
+                .make.wire()\
+                .align().stack_z1(gear)\
+                .cleanup.build_curves_3d()
+
+            spine = WireSketcher().line_to(z=height, is_relative=True).get_wire_part(self._part_cache)
+
+            gear = gear.cleanup.build_curves_3d()
+            gear = gear.loft.pipe(spine_part=spine, aux_spine=helix)
+
+            return gear
 
         def _do():
             profile = self.create_involute_profile(gear_spec)
 
-            spine = WireSketcher(0, 0, 0).line_to(z=height).get_wire_part()
-
-            # create a spiral aux spine to "encourage" OCC to make a helix sweep. unit radius
-            logger.info(f"Height of cylinder surface: {height}")
-
-            surf = Geom_CylindricalSurface(gp_Ax3(gp_XOY()), gear_spec.pitch_diameter / 2)
-
-            # the actual angle of the circle that needs to be swept depends on the gear height
-            helix_angle_rad = math.radians(helix_angle_deg)
-            logger.info(f"Helix angle in degrees: {helix_angle_deg} -> radians: {helix_angle_rad}")
-
-            sweep_distance_du = 0.5 * (height / sweep_cycles) * math.tan(helix_angle_rad)
-            logger.info(f"Sweep distance (on pitch diameter) of gear: {sweep_distance_du}")
-
-            sweep_angle_rad = sweep_distance_du / (gear_spec.pitch_diameter / 2)
-            logger.info(f"Sweep angle in radians: {sweep_angle_rad}")
-
-            if not sweep_sense:
-                sweep_angle_rad *= -1
-
-            mkw = BRepBuilderAPI_MakeWire()
-            sweep_height = height / sweep_cycles
-            for i in range(0, sweep_cycles):
-                height_start = i * sweep_height
-                height_mid = (i + 0.5) * sweep_height
-                height_end = (i + 1) * sweep_height
-
-                edge0 = BRepBuilderAPI_MakeEdge(
-                    OCC.Core.GCE2d.GCE2d_MakeSegment(gp_Pnt2d(sweep_angle_rad, height_start), gp_Pnt2d(0, height_mid)).Value(), surf).Edge()
-                edge1 = BRepBuilderAPI_MakeEdge(
-                    OCC.Core.GCE2d.GCE2d_MakeSegment(gp_Pnt2d(0, height_mid), gp_Pnt2d(sweep_angle_rad, height_end)).Value(), surf).Edge()
-
-                mkw.Add(edge0)
-                mkw.Add(edge1)
-
-            aux_spine = Part(NoOpCacheToken(), mkw.Wire())
-
-            mkps = BRepOffsetAPI_MakePipeShell(spine.shape)
-            mkps.SetMode(aux_spine.shape, True)
-            mkps.Add(profile.shape)
-            mkps.Build()
-
-            if make_solid:
-                mkps.MakeSolid()
-
-            result = Part(NoOpCacheToken(), mkps.Shape())
+            result = extrude_gear_profile(profile.sp("body"), sense=sweep_sense)
 
             if chamfer is not None:
                 logger.info(f"Applying chamfer: {chamfer}")
-                cylinder_common = PartFactory.cylinder(gear_spec.outside_diameter / 2, height).fillet.chamfer_edges(chamfer)
+                cylinder_common = self._part_factory.cylinder(gear_spec.outside_diameter / 2, height).fillet.chamfer_edges(chamfer)
 
                 result = result.bool.common(cylinder_common)
 
-            return result.with_cache_token(token)
+            clearance = self._part_factory.cylinder(gear_spec.outside_diameter / 2, height)
+
+            return profile.do_on("body", consumer=lambda p: result).insert(clearance.name("clearance"))\
+                .with_driver(GearDriver)\
+                .with_cache_token(token)
 
         return self._part_cache.ensure_exists(token, _do)
+
+
+class GearDriver(PartDriver):
+
+    def __init__(self, part: Part):
+        super().__init__(part)
+
+    @property
+    def center(self) -> typing.Tuple[float, float, float]:
+        return self.part.sp("center").xts.xyz_mid
+
+    @property
+    def gear_spec(self) -> GearSpec:
+        return GearSpec(
+            module=float(self.part.annotation("gear_spec/module")),
+            num_teeth=int(self.part.annotation("gear_spec/num_teeth")),
+            pressure_angle_deg=float(self.part.annotation("gear_spec/pressure_angle_deg")))
+
+    def to(self, other: Part) -> Part:
+        return self.part.align("center").by("xmidymidzmid", other.sp("center"))
+
+    def get_rotation_axis(self) -> gp_Ax1:
+        r0, r1 = InterrogateUtils.line_points(self.part.sp("rotation_axis").explore.edge.get()[0].shape)
+
+        return gp_Ax1(
+            gp_Pnt(*self.part.sp("center").xts.xyz_mid),
+            gp_Dir(
+                r1.X() - r0.X(),
+                r1.Y() - r0.Y(),
+                r1.Z() - r0.Z()))
+
+    def get_local_x(self) -> gp_Vec:
+        r0, r1 = InterrogateUtils.line_points(self.part.sp("local_x").explore.edge.get()[0].shape)
+        return gp_Vec(r0, r1)
+
+    def get_local_y(self) -> gp_Vec:
+        r0, r1 = InterrogateUtils.line_points(self.part.sp("local_y").explore.edge.get()[0].shape)
+        return gp_Vec(r0, r1)
+
+    def single_tooth_rotation_radians(self) -> float:
+        self_spec = self.gear_spec
+        return 2.0 * math.pi / self_spec.num_teeth
+
+    def rotate(self, tooth_count: float) -> Part:
+        return self.part.tr.rotate(
+            angle=tooth_count * self.single_tooth_rotation_radians(),
+            ax1=self.get_rotation_axis())
+
+    def position_with(self, other_gear_part: Part, clearance: float = 0) -> Part:
+        self_spec = self.gear_spec
+        other_spec = other_gear_part.driver(GearDriver).gear_spec
+
+        if self_spec.module != other_spec.module:
+            raise ValueError("Incompatible gear spec modules")
+
+        required_distance = (self_spec.pitch_diameter + other_spec.pitch_diameter) / 2 + clearance
+
+        center_pnt_from = gp_Pnt(*self.part.sp("center").xts.xyz_mid)
+
+        center_pnt_to = gp_Pnt(*other_gear_part.sp("center").xts.xyz_mid)
+
+        translation_vec = gp_Vec(center_pnt_from, center_pnt_to)
+
+        if translation_vec.SquareMagnitude() == 0:
+            translation_vec = gp_Vec(1, 0, 0)
+
+        translation_vec = translation_vec.Normalized()
+
+        translation_vec = translation_vec.Scaled(-required_distance)
+
+        return self.part.align("center")\
+            .by("xmidymidzmid", other_gear_part.sp("center"))\
+            .tr.mv(dx=translation_vec.X(), dy=translation_vec.Y(), dz=translation_vec.Z())
+
+
+class RackDriver(PartDriver):
+
+    def __init__(self, part: Part):
+        super().__init__(part)
+
+    @property
+    def gear_spec(self) -> GearSpec:
+        return GearSpec(
+            module=float(self.part.annotation("gear_spec/module")),
+            num_teeth=int(self.part.annotation("gear_spec/num_teeth")),
+            pressure_angle_deg=float(self.part.annotation("gear_spec/pressure_angle_deg")))
+
+    def get_local_x(self) -> typing.Tuple[float, float, float]:
+        r0, r1 = InterrogateUtils.line_points(self.part.sp("pitch_line").explore.edge.get()[0].shape)
+        result = gp_Vec(r0, r1).Normalized()
+        return result.X(), result.Y(), result.Z()
+
+    def get_local_y(self) -> typing.Tuple[float, float, float]:
+        r0, r1 = InterrogateUtils.line_points(self.part.sp("pitch_perpendicular_line").explore.edge.get()[0].shape)
+        result = gp_Vec(r0, r1)
+        return result.X(), result.Y(), result.Z()
+
+    def single_tooth_translation(self) -> typing.Tuple[float, float, float]:
+        gear_spec = self.gear_spec
+
+        result = gp_Vec(*self.get_local_x()).Scaled(math.pi * gear_spec.module)
+
+        return result.X(), result.Y(), result.Z()
+
+    def translate(self, tooth_count: float) -> Part:
+        translation = gp_Vec(*self.single_tooth_translation()).Scaled(tooth_count)
+        return self.part.tr.translate(
+            translation.X(),
+            translation.Y(),
+            translation.Z())
+
+    def position_with(self, other_gear_part: Part, clearance: float = 0) -> Part:
+        self_spec = self.gear_spec
+        other_driver: GearDriver = other_gear_part.driver(GearDriver)
+        other_spec = other_driver.gear_spec
+
+        if self_spec.module != other_spec.module:
+            raise ValueError("Incompatible gear spec modules")
+
+        pitch_line_start_point = gp_Pnt(*self.part.sp("pitch_line").explore.vertex.get()[0].xts.xyz_mid)
+
+        pitch_line_vec = gp_Vec(*self.get_local_x())
+        pitch_line_start_to_center = gp_Vec(
+            pitch_line_start_point,
+            gp_Pnt(*other_driver.center))
+
+        pitch_line_offset_amount = pitch_line_vec.Dot(pitch_line_start_to_center)
+        pitch_line_tooth_count_offset = pitch_line_offset_amount / (math.pi * self_spec.module)
+
+        from_point = pitch_line_start_point.Translated(pitch_line_vec.Normalized().Scaled(pitch_line_offset_amount))
+
+        # at this point, from_point to center should be perpendicular to the pitch line
+
+        pitch_line_to_center_vec = gp_Vec(from_point, gp_Pnt(*other_driver.center))
+
+        part_overlapped = self.part.tr.mv(
+            pitch_line_to_center_vec.X(),
+            pitch_line_to_center_vec.Y(),
+            pitch_line_to_center_vec.Z()
+        )
+
+        # back off in the reverse of the local y direction
+        offset = (gp_Vec(*self.get_local_y()).Normalized()
+                  .Reversed().Scaled(clearance + other_driver.gear_spec.pitch_diameter / 2))
+
+        result = part_overlapped.tr.mv(
+            offset.X(),
+            offset.Y(),
+            offset.Z()
+        )
+
+        return result
 
 
 def translate_js_lib_to_python():
@@ -509,5 +798,16 @@ def translate_js_lib_to_python():
 
     translate = js2py.translate_js6(js_source)
 
-    pdb.set_trace()
+    return translate
 
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output_file")
+
+    args = parser.parse_args()
+
+    translated = translate_js_lib_to_python()
+
+    with open(args.output_file, 'w') as f:
+        f.write(translated)

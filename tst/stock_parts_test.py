@@ -24,7 +24,7 @@ from ezocc.part_manager import Part, PartFactory, NoOpPartCache
 
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
 
-from ezocc.stock_parts import StockParts
+from ezocc.stock_parts.misc import StockParts
 
 
 class TestPart(unittest.TestCase):

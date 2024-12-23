@@ -38,6 +38,20 @@ class TestSubshapeMap(unittest.TestCase):
         self._part_cache = InMemoryPartCache()
         self._part_factory = PartFactory(self._part_cache)
 
+    def test_annotation_persists_through_compound(self):
+        part_a = self._part_factory.box(10, 10, 10).annotate("keyA", "valueA")
+        part_b = self._part_factory.box(10, 10, 10).annotate("keyB", "valueB")
+
+        comp = self._part_factory.compound(part_a.name("part-a"), part_b.name("part-b"))
+
+        self.assertEqual(dict(), comp.annotations)
+
+        part_a_recovered = comp.sp("part-a")
+        part_b_recovered = comp.sp("part-b")
+
+        self.assertEqual(part_a.annotations, part_a_recovered.annotations)
+        self.assertEqual(part_b.annotations, part_b_recovered.annotations)
+
     def test_annotation_persists_after_boolop(self):
         box = self._part_factory.box(10, 10, 10, x_max_face_name="xmax")\
             .annotate_subshape("xmax", ("color", "white"))

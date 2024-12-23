@@ -1,88 +1,63 @@
+import copy
 import typing
 
-from ezocc.cad.model.event import Listenable, SessionEvent, SessionEventType
-from ezocc.cad.model.work_unit import WorkUnit
-from ezocc.cad.model.work_unit_factory import WorkUnitCommandFactory
-from ezocc.cad.model.workspace.workspace import Workspace
+from ezocc.cad.model.cache.session_cache import SessionCache
+from ezocc.cad.model.directors.session_director import SessionDirector
+from ezocc.cad.model.event import Listenable
+from ezocc.cad.model.scene_transforms.scene_transforms import SceneTransforms
+from ezocc.cad.model.widgets.widget import Widget
+from ezocc.occutils_python import SetPlaceablePart
 
 
 class Session(Listenable):
+    """
+    Represents an interactive view session with input drivers. Each driver can be thought of as
+    A "knob" to enact some kind of change on the input parts. The changes are limited to those
+    requiring simple transforms of existing parts, basically anything that does not require
+    re-triangulation.
+    """
 
-    def __init__(self):
+    def __init__(self,
+                 cache: SessionCache,
+                 parts: typing.Set[SetPlaceablePart],
+                 directors: typing.List[SessionDirector],
+                 widgets: typing.Set[Widget]):
         super().__init__()
 
-        self._root_unit = WorkUnit(name="root", parent=None, commands=[])
-        self._selected_unit: typing.Optional[WorkUnit] = None
-        self._workspace: typing.Optional[Workspace] = None
-        self._error_state: typing.Optional[BaseException] = None
-        self.work_unit_command_factory = WorkUnitCommandFactory()
+        self._cache = cache
+        self._parts = copy.copy(parts)
+        self._directors = copy.copy(directors)
+        self._widgets = copy.copy(widgets)
+        self._scene_transforms = SceneTransforms()
 
     @property
-    def root_unit(self):
-        return self._root_unit
+    def cache(self) -> SessionCache:
+        return self._cache
 
     @property
-    def selected_work_unit(self) -> typing.Optional[WorkUnit]:
-        return self._selected_unit
+    def scene_transforms(self) -> SceneTransforms:
+        return self._scene_transforms
 
-    def select_work_unit(self, work_unit: WorkUnit):
-        if work_unit is not None and not WorkUnit.is_parent(self._root_unit, work_unit):
-            raise ValueError("Work unit not present in document")
+    def update(self):
+        self._scene_transforms = SceneTransforms()
 
-        if self._selected_unit == work_unit:
-            # no change made
-            return
+        # iterate over all drivers to apply transforms
+        for director in self.directors:
+            for part in director.get_affected_parts():
+                director.push_transform(self._scene_transforms, part)
 
-        self._set_selected_work_unit(work_unit)
-        self.listener_manager.notify(SessionEvent(self, SessionEventType.UPDATED))
-
-    def add_work_unit_to_selected(self):
-        if self._selected_unit is None:
-            raise ValueError("No Work Unit is currently selected")
-
-        wu = WorkUnit("new work unit", self._selected_unit, [])
-        self._selected_unit.add_child(wu)
-        self._set_selected_work_unit(wu)
-        self.listener_manager.notify(SessionEvent(self, SessionEventType.INDIRECT))
-
-    def delete_selected_work_unit(self):
-        if self._selected_unit is None:
-            raise ValueError("No Work Unit is currently selected")
-
-        if self._selected_unit.parent is None:
-            raise ValueError("Cannot delete root work unit")
-
-        to_remove = self._selected_unit
-        self._set_selected_work_unit(self._selected_unit.parent)
-        self._selected_unit.remove_child(to_remove)
-        self.listener_manager.notify(SessionEvent(self, SessionEventType.UPDATED))
-
-    def _set_selected_work_unit(self, new_unit: typing.Optional[WorkUnit]):
-        if self._selected_unit is not None:
-            self._selected_unit.listener_manager.remove_listener(self._selected_work_unit_changed)
-
-        self._selected_unit = new_unit
-        self._selected_unit.listener_manager.add_listener(self._selected_work_unit_changed)
-        self._workspace = None
-        self.build_workspace()
-
-    def _selected_work_unit_changed(self, session_event: SessionEvent):
-        self.build_workspace()
-        self.listener_manager.notify(SessionEvent(self, SessionEventType.INDIRECT))
+    def change_parts(self, new_parts: typing.Set[SetPlaceablePart]):
+        self._parts = new_parts.copy()
+        self.listener_manager.notify(self)
 
     @property
-    def workspace(self):
-        return self._workspace
+    def parts(self) -> typing.Set[SetPlaceablePart]:
+        return copy.copy(self._parts)
 
-    def build_workspace(self):
-        if self._selected_unit is None:
-            return None
+    @property
+    def directors(self) -> typing.List[SessionDirector]:
+        return copy.copy(self._directors)
 
-        try:
-            self._workspace = self._selected_unit.perform()
-        except BaseException as e:
-            self._workspace = None
-            self._error_state = e
-            print(e)
-
-        self.listener_manager.notify(SessionEvent(self, SessionEventType.UPDATED))
+    @property
+    def widgets(self) -> typing.Set[Widget]:
+        return copy.copy(self._widgets)

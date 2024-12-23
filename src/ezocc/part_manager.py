@@ -14,7 +14,7 @@ import OCC
 import OCC.Core.Addons
 import OCC.Core.BOPAlgo
 import OCC.Core.BRepAlgoAPI
-import OCC.Core.BRepAlgoAPI
+import OCC.Core.BRepAdaptor
 import OCC.Core.BRepBuilderAPI
 import OCC.Core.BRepBuilderAPI
 import OCC.Core.BRepCheck
@@ -22,11 +22,12 @@ import OCC.Core.BRepFilletAPI
 import OCC.Core.BRepOffset
 import OCC.Core.BRepOffsetAPI
 import OCC.Core.BRepExtrema
+import OCC.Core.BRepPrim
 import OCC.Core.BRepPrimAPI
 import OCC.Core.BRepLib
 import OCC.Core.BOPAlgo
 import OCC.Core.BRep
-import OCC.Core.BRepTools as BRepTools
+from OCC.Core.BRep import BRep_Tool
 import OCC.Core.GeomAbs
 import OCC.Core.GC
 import OCC.Core.GCE2d
@@ -40,6 +41,8 @@ import OCC.Core.TopAbs as ta
 import OCC.Core.TopOpeBRepBuild
 import OCC.Core.TopTools
 import OCC.Core.TopoDS
+import OCC.Core.HLRAlgo
+import OCC.Core.HLRBRep
 import OCC.Core.gp
 import OCC.Core.gp as gp
 import parsimonious
@@ -49,6 +52,8 @@ from OCC.Core.Message import Message_Gravity, Message_ProgressIndicator
 from OCC.Core._TopAbs import TopAbs_WIRE, TopAbs_EDGE
 from parsimonious import Grammar
 import importlib
+import OCC.Core.Standard
+from scipy.spatial import Voronoi
 
 import ezocc.occutils_python as op
 
@@ -58,6 +63,8 @@ import pickle
 import uuid
 import copyreg
 
+from ezocc.alg.canonical_recognition import ShapeCanonicalizer
+from ezocc.cad.model.widgets.widget import Widget
 from ezocc.humanization import Humanize
 from ezocc.subshape_mapping import SubshapeMap, T_MKS, AnnotatedShape
 
@@ -157,20 +164,16 @@ class PartDriver:
         return self._part
 
 
-class PartPredicate:
-    """
-    Shorthand to indicate a boolean part filter.
-    """
-
-    def __call__(self, part: Part) -> bool:
-        raise NotImplementedError()
-
-
 class Part:
 
     @staticmethod
-    def of_shape(shape: OCC.Core.TopoDS.TopoDS_Shape):
-        return Part(NoOpCacheToken(), SubshapeMap(AnnotatedShape(shape)))
+    def of_shape(shape: OCC.Core.TopoDS.TopoDS_Shape, cache: PartCache = None):
+        if cache is None:
+            cache_token = NoOpCacheToken()
+        else:
+            cache_token = cache.create_token(shape)
+
+        return Part(cache_token, SubshapeMap(AnnotatedShape(shape)))
 
     def __init__(self, cache_token: CacheToken, subshape_map: SubshapeMap):
         if not isinstance(cache_token, CacheToken):
@@ -180,9 +183,19 @@ class Part:
             raise ValueError("Subshape map expected")
 
         self._extents = None
+        self._set_placeable_part = None
         self._driver: typing.Optional[PartDriver] = None
         self._cache_token = cache_token
         self._subshapes = subshape_map.clone().pruned()
+
+    @property
+    def set_placeable(self) -> op.SetPlaceablePart:
+        if self._set_placeable_part is not None:
+            return self._set_placeable_part
+
+        self._set_placeable_part = op.SetPlaceablePart(self)
+
+        return self._set_placeable_part
 
     TDriver = typing.TypeVar("TDriver")
 
@@ -205,7 +218,7 @@ class Part:
             actual_driver_cls = getattr(actual_driver_cls, substr)
 
         if expected_driver_cls != actual_driver_cls:
-            raise ValueError("Expected driver class does not match actual")
+            raise ValueError(f"Expected driver class ({expected_driver_cls}) does not match actual ({actual_driver_cls})")
 
         driver = actual_driver_cls(self)
 
@@ -237,6 +250,14 @@ class Part:
             self._cache_token.mutated("part", "annotated", attribute_name, attribute_value),
             self._subshapes.with_updated_root_shape(
                 self._subshapes.root_shape.with_updated_attribute(attribute_name, attribute_value)))
+
+    def clear_subshape_map(self):
+        """
+        @return: A new part with equivalent shape to this, but with no labeled subshapes
+        """
+        return Part(
+            self._cache_token.mutated("part", "clear_subshape_map"),
+            SubshapeMap(self._subshapes.root_shape))
 
     def clear_annotations(self):
         new_map = SubshapeMap(AnnotatedShape(self.shape), self._subshapes.map)
@@ -312,9 +333,19 @@ class Part:
     def validate(self):
         return PartValidate(self)
 
-    def preview(self, *preview_with: Part, **kwargs) -> Part:
-        Part.visualize(self, *preview_with, **kwargs)
+    def preview(self,
+                *preview_with: Part,
+                directors=(),
+                widgets: typing.Set[Widget] = None) -> Part:
+        Part.visualize(self, *preview_with, directors=directors, widgets=widgets)
         return self
+
+    def preview_offscreen(self,
+                *preview_with: Part,
+                resolution: typing.Tuple[int, int],
+                directors=(),
+                widgets: typing.Set[Widget] = None):
+        return Part.visualize_offscreen(self, *preview_with, resolution=resolution, directors=directors, widgets=widgets)
 
     def print_recursive(self) -> Part:
 
@@ -323,6 +354,9 @@ class Part:
 
             if shape.ShapeType() == OCC.Core.TopAbs.TopAbs_EDGE:
                 shape_rep += f" ({Humanize.curve_type(op.InterrogateUtils.curve_type(shape))})"
+
+            if shape.Orientable():
+                shape_rep += f" orientation({Humanize.orientation(shape.Orientation())})"
 
             print("    " * indent_level, shape_rep + " " + str(id(shape)))
             for s in op.InterrogateUtils.traverse_direct_subshapes(shape):
@@ -347,7 +381,10 @@ class Part:
 
         result += ''.join("\n    " + str(n) + ": " + str(s) for n, s in self.subshapes.map.items())
 
-        result += f"\nBBox: xyz_span{self.extents.xyz_span} xyz_min:{self.extents.xyz_min} - xyz_max{self.extents.xyz_max}\n"
+        if self.inspect.is_compound() and op.InterrogateUtils.is_empty_compound(self.shape):
+            result += "\nBBox: part is empty"
+        else:
+            result += f"\nBBox: xyz_span{self.extents.xyz_span} xyz_min:{self.extents.xyz_min} - xyz_max{self.extents.xyz_max}\n"
 
         return result
 
@@ -383,6 +420,7 @@ class Part:
 
     def name_subshape(self, subshape_part: Part, name: str) -> Part:
         # todo: how should we handle attributes here? perhaps not accept a part but TopoDS_Shape
+        # todo: think I have resolved this by asserting that subshape maps may not contain conflicting annotated shapes
 
         if not isinstance(subshape_part, Part):
             raise ValueError("Expected Part")
@@ -392,9 +430,9 @@ class Part:
             raise ValueError("Subshape does not belong to part. Consider add() instead.")
 
         new_subshapes = self._subshapes.clone()
-        new_subshapes.place(name, AnnotatedShape(subshape_part._subshapes.root_shape.set_placeable_shape))
+        new_subshapes.place(name, subshape_part._subshapes.root_shape)
 
-        return Part(self._cache_token.mutated("name_subshape", subshape_part), new_subshapes)
+        return Part(self._cache_token.mutated("name_subshape", subshape_part, name), new_subshapes)
 
     def name_recurse(self,
                      name: str,
@@ -420,6 +458,9 @@ class Part:
                 new_subshape_map.place(name, AnnotatedShape(s))
 
         return Part(self._cache_token.mutated("name_recurse", name, inspect.getsource(subshape_filter)), new_subshape_map)
+
+    def remove_sp_named(self, name: str):
+        return self.remove(self.sp(name))
 
     def remove(self, *subparts: Part):
         """
@@ -472,7 +513,7 @@ class Part:
     def do_on(self,
               *names: str,
               consumer: typing.Callable[[Part], Part] = None,
-              part_filter: PartPredicate = None) -> Part:
+              part_filter: typing.Callable[[Part], bool] = None) -> Part:
         if len(names) == 0:
             raise ValueError("At least one name required")
 
@@ -586,16 +627,31 @@ class Part:
         for i in range_supplier:
             result.append(part_modifier(result[-1]))
 
-        return PartFactory.compound(*result)
+        return PartFactory(self._cache_token.get_cache()).compound(*result)
 
     @staticmethod
-    def visualize(*parts):
+    def visualize_offscreen(*parts,
+                            resolution: typing.Tuple[int, int],
+                            directors=(),
+                            widgets: typing.Set[Widget] = None):
         if len(parts) == 0:
             raise ValueError("No arguments. Did you mean to call non-static method preview()?")
 
         import ezocc.cad.gui.visualization as pv
 
-        pv.visualize_parts(*parts)
+        return pv.visualize_parts_offscreen(*parts, resolution=resolution, directors=directors, widgets=widgets)
+
+
+    @staticmethod
+    def visualize(*parts,
+                  directors=(),
+                  widgets: typing.Set[Widget] = None):
+        if len(parts) == 0:
+            raise ValueError("No arguments. Did you mean to call non-static method preview()?")
+
+        import ezocc.cad.gui.visualization as pv
+
+        pv.visualize_parts(*parts, directors=directors, widgets=widgets)
 
     def align(self, *subshape_names: str) -> PartAligner:
         return PartAligner(self, *subshape_names)
@@ -628,6 +684,10 @@ class Part:
         :return: this Parts root shape
         """
         return self._subshapes.root_shape.set_placeable_shape
+
+    @property
+    def oriented(self):
+        return PartOrient(self)
 
     @property
     def array(self) -> PartArray:
@@ -689,6 +749,13 @@ class Part:
     def cast(self):
         return PartCast(self)
 
+    def subshapes_with_updated_root_shape(self, shape) -> SubshapeMap:
+        # optimization to prevent unnecessary copy access
+        return self._subshapes.with_updated_root_shape(shape)
+
+    def subshapes_items(self):
+        return self._subshapes.items()
+
     @property
     def subshapes(self) -> SubshapeMap:
         """
@@ -700,7 +767,7 @@ class Part:
         # clone takes a performance hit but is safer
         return self._subshapes.clone()
 
-    def compound_subpart(self, name: str, part_filter: PartPredicate = None) -> Part:
+    def compound_subpart(self, name: str, part_filter: typing.Callable[[Part], bool] = None) -> Part:
         """
         :return: A new Part, with root shape as a compound of all subshapes that have the specified name.
         Note that the subshape map is unaltered.
@@ -720,10 +787,10 @@ class Part:
         subshapes = self._subshapes.get(name)
         return [Part(self._cache_token.mutated(s), self._subshapes.with_updated_root_shape(s)) for s in subshapes]
 
-    def sp(self, *names, part_filter: PartPredicate = None) -> Part:
+    def sp(self, *names, part_filter: typing.Callable[[Part], bool] = None) -> Part:
         return self.single_subpart(*names, part_filter=part_filter)
 
-    def single_subpart(self, *names: str, part_filter: PartPredicate = None) -> Part:
+    def single_subpart(self, *names: str, part_filter: typing.Callable[[Part], bool] = None) -> Part:
         """
         Ensures that a single subshape exists with given name, and returns a Part with it as the root shape.
         subshape map is unaltered.
@@ -806,6 +873,10 @@ class Part:
                     SubshapeMap(self._shape, new_subshapes))
 
     @property
+    def alg(self) -> PartAlgorithm:
+        return PartAlgorithm(self)
+
+    @property
     def sew(self):
         return PartSew(self)
 
@@ -880,6 +951,130 @@ class LazyLoadedPart(Part):
         return getattr(self._part, item)
 
 
+class PartAlgorithm:
+    """
+    Access to utilities for performing various algorithmic operations on parts. Most
+    algorithms can be found in the ezocc.alg package
+    """
+
+    def __init__(self, part: Part):
+        self._part = part
+
+    def edge_network_to_outer_wire(self, use_tangent_method: bool = False) -> Part:
+        """
+        Take the current part, with possibly overlapping edges, and merge to a single outer wire.
+        TODO: "islands" (clusters of edges that are not connected indirectly to the rest) are not currently
+        supported, but should be in future
+
+        @param use_tangent_method: use the unstable tangent finding method to compute the outer wire
+        """
+        token = self._part.cache_token.mutated("edge_network_to_outer_wire")
+
+        def _do():
+
+            if use_tangent_method:
+                from ezocc.alg.geometry_exploration import outer_wire_by_tangents
+
+                return outer_wire_by_tangents.get_outer_wire(self._part).with_cache_token(token)
+            else:
+
+                from ezocc.alg.geometry_exploration.edge_network.edge_network import EdgeNetwork
+                from ezocc.alg.geometry_exploration import outer_wire_by_bool
+
+                return outer_wire_by_bool.get_outer_wire(self._part).with_cache_token(token)
+
+        return self._part.cache_token.get_cache().ensure_exists(token, _do)
+
+    def project_x(self):
+        return self.project_to_edge_network((0, 0, 0), (1, 0, 0), is_perspective=False, cam_focus=100)
+
+    def project_y(self):
+        return self.project_to_edge_network((0, 0, 0), (0, 1, 0), is_perspective=False, cam_focus=100)
+
+    def project_z(self):
+        return self.project_to_edge_network((0, 0, 0), (0, 0, 1), is_perspective=False, cam_focus=100)
+
+    def project_to_edge_network(self,
+                                cam_origin: typing.Tuple[float, float, float],
+                                cam_direction: typing.Tuple[float, float, float],
+                                is_perspective: bool,
+                                cam_focus: float,
+                                transform_to_camera_plane: bool = True):
+        token = self._part.cache_token.mutated("project_to_edge_network",
+                                               inspect.getsource(PartAlgorithm.project_to_edge_network),
+                                               cam_origin,
+                                               cam_direction,
+                                               is_perspective,
+                                               cam_focus,
+                                               transform_to_camera_plane)
+
+        def _do() -> Part:
+            """
+            Project the current part onto a plane, rendering as a network of edges
+            """
+            dir = OCC.Core.gp.gp_Dir(*cam_direction)
+
+            ax = OCC.Core.gp.gp_Ax3(OCC.Core.gp.gp_Ax2(gp.gp.Origin(), dir))
+
+            trsf = OCC.Core.gp.gp_Trsf()
+            trsf.SetTransformation(ax.Translated(OCC.Core.gp.gp_Vec(*cam_origin)))
+
+            proj = OCC.Core.HLRAlgo.HLRAlgo_Projector(trsf, is_perspective, cam_focus)
+
+            alg = OCC.Core.HLRBRep.HLRBRep_Algo()
+            alg.Projector(proj)
+            alg.ShowAll()
+            alg.Add(self._part.shape)
+
+            alg.Update()
+
+            to_shape = OCC.Core.HLRBRep.HLRBRep_HLRToShape(alg)
+
+            result = [
+                to_shape.Rg1LineVCompound(),
+                to_shape.Rg1LineHCompound(),
+                to_shape.OutLineVCompound(), # got v bars
+                to_shape.OutLineHCompound(),
+                to_shape.IsoLineHCompound(),
+                to_shape.IsoLineVCompound(),
+                to_shape.VCompound(), # got end caps
+                to_shape.HCompound()
+            ]
+
+            result = [Part.of_shape(s) for s in result if s is not None]
+            result = PartFactory(self._part._cache_token.get_cache()).compound(*result)\
+                .cleanup.build_curves_3d()\
+                .bool.union()
+
+            if transform_to_camera_plane:
+                result = result.transform(lambda t:
+                                          t.SetTransformation(
+                                              ax.Translated(gp.gp_Vec(*cam_origin)),
+                                              gp.gp_Ax3(gp.gp.XOY())))
+
+            return result.with_cache_token(token)
+
+        return self._part.cache_token.get_cache().ensure_exists(token, _do)
+
+    def remove_features(self, *features: Part):
+        rf = OCC.Core.BOPAlgo.BOPAlgo_RemoveFeatures()
+        rf.SetShape(self._part.shape)
+
+        for feature in features:
+            if not feature.inspect.is_face():
+                raise ValueError("Removed features must be faces")
+
+            rf.AddFaceToRemove(feature.shape)
+
+        token = self._part.cache_token.mutated("remove_features", features)
+
+        rf.Perform()
+
+        result = rf.Shape()
+
+        return Part(token, self._part.subshapes.map_subshape_changes(AnnotatedShape(result), rf.History()))
+
+
 class PartSew:
 
     def __init__(self, part: Part):
@@ -897,8 +1092,8 @@ class PartSew:
 
         return self._part.map_subshape_changes(token, sewed_shape, mks=sew.GetContext().History())
 
-    def faces(self) -> Part:
-        token = self._part.cache_token.mutated("sew", "faces")
+    def faces(self, convert_to_solid_if_input=True) -> Part:
+        token = self._part.cache_token.mutated("sew", "faces", convert_to_solid_if_input)
 
         sew = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_Sewing()
         for f in self._part.explore.face.get():
@@ -908,7 +1103,12 @@ class PartSew:
 
         sewed_shape = sew.SewedShape()
 
-        return self._part.map_subshape_changes(token, sewed_shape, mks=sew.GetContext().History())
+        result = self._part.map_subshape_changes(token, sewed_shape, mks=sew.GetContext().History())
+
+        if self._part.inspect.is_solid() and convert_to_solid_if_input:
+            return result.make.solid()
+        else:
+            return result
 
     def edges(self) -> Part:
         token = self._part.cache_token.mutated("sew", "edges")
@@ -957,16 +1157,125 @@ class PartValidate:
         return self._part
 
 
+class PartInspectVertex:
+
+    def __init__(self, part: Part):
+        if not part.inspect.is_vertex():
+            raise ValueError("Part is not a vertex type")
+
+        self._part = part
+
+    @property
+    def xyz(self) -> typing.Tuple[float, float, float]:
+        return op.InterrogateUtils.vertex_to_xyz(self._part.shape)
+
+
+class PartInspectEdge:
+
+    def __init__(self, part: Part):
+        if not part.inspect.is_edge():
+            raise ValueError("Part is not an edge type")
+
+        self._part = part
+
+    @property
+    def is_degenerated(self) -> bool:
+        return BRep_Tool.Degenerated(self._part.shape)
+
+    def circle(self, tolerance: float) -> gp.gp_Circ:
+        if self.curve_type != OCC.Core.GeomAbs.GeomAbs_CurveType.GeomAbs_Circle:
+            try_as_circ = ShapeCanonicalizer(self._part.shape, tolerance).circle
+            if try_as_circ is not None:
+                return try_as_circ
+
+            raise ValueError(f"Edge is not a circle curve (was instead {Humanize.curve_type(self.curve_type)})")
+
+        adaptor = OCC.Core.BRepAdaptor.BRepAdaptor_Curve(self._part.shape)
+        return adaptor.Circle()
+
+    def complementary_vertex(self, vertex: Part) -> Part:
+        """
+        Given a vertex which is one endpoint of the edge, returns the complementary (other) vertex.
+        """
+
+        if not vertex.inspect.is_vertex():
+            raise ValueError("Part is not a vertex")
+
+        v0, v1 = self._part.explore.vertex.get()
+
+        if v0.bool.intersects(v1):
+            raise ValueError("Edge endpoints are identical")
+
+        v0_intersects = v0.bool.intersects(vertex)
+        v1_intersects = v1.bool.intersects(vertex)
+
+        if not v0_intersects and not v1_intersects:
+            raise ValueError("Neither endpoint intersects the specified vertex")
+
+        if v0_intersects and not v1_intersects:
+            return v1
+        else:
+            return v0
+
+    def edge_tangents(self) -> typing.Tuple[
+        typing.Tuple[float, float, float],
+        typing.Tuple[float, float, float]
+    ]:
+        result = op.InterrogateUtils.line_tangent_points(self._part.shape)
+
+        return (
+            (result[0].X(), result[0].Y(), result[0].Z()),
+            (result[1].X(), result[1].Y(), result[1].Z())
+        )
+
+    def edge_end_points(self) -> typing.Tuple[
+        typing.Tuple[float, float, float],
+        typing.Tuple[float, float, float]
+    ]:
+        result = op.InterrogateUtils.line_points(self._part.shape)
+
+        return (
+            (result[0].X(), result[0].Y(), result[0].Z()),
+            (result[1].X(), result[1].Y(), result[1].Z())
+        )
+
+    @property
+    def length(self) -> float:
+        lp = op.InterrogateUtils.linear_properties(self._part.shape)
+        return lp.Mass()
+
+    def is_line(self) -> bool:
+        return self.curve_type == OCC.Core.GeomAbs.GeomAbs_CurveType.GeomAbs_Line
+
+    @property
+    def curve_type(self) -> OCC.Core.GeomAbs.GeomAbs_CurveType:
+        return op.InterrogateUtils.curve_type(self._part.shape)
+
+
 class PartInspect:
 
     def __init__(self, part: Part):
         self._part = part
+
+    @property
+    def edge(self) -> PartInspectEdge:
+        return PartInspectEdge(self._part)
+
+    @property
+    def vertex(self) -> PartInspectVertex:
+        return PartInspectVertex(self._part)
 
     def is_face(self) -> bool:
         return self._part.shape.ShapeType() == OCC.Core.TopAbs.TopAbs_FACE
 
     def is_compound(self) -> bool:
         return self._part.shape.ShapeType() == OCC.Core.TopAbs.TopAbs_COMPOUND
+
+    def is_empty_compound(self) -> bool:
+        return op.InterrogateUtils.is_empty_compound(self._part.shape)
+
+    def is_compound_of(self, shape_type: OCC.Core.TopAbs.TopAbs_ShapeEnum):
+        return self.is_compound() and op.InterrogateUtils.is_compound_of(self._part.shape, shape_type)
 
     def is_compsolid(self) -> bool:
         return self._part.shape.ShapeType() == OCC.Core.TopAbs.TopAbs_COMPSOLID
@@ -1016,7 +1325,7 @@ class PartInspect:
         shape = op.InterrogateUtils.outer_wire(self._part.shape)
 
         return Part(self._part.cache_token.mutated("inspect", "outer_wire"),
-                    self._part.subshapes.with_updated_root_shape(shape))
+                    self._part.subshapes_with_updated_root_shape(shape))
 
     def com(self) -> Part:
         com = op.InterrogateUtils.center_of_mass(self._part.shape)
@@ -1024,6 +1333,15 @@ class PartInspect:
         return PartFactory(self._part.cache_token.get_cache())\
             .vertex(*com)\
             .with_cache_token(self._part.cache_token.mutated("inspect", "com"))
+
+    def orientation(self):
+        return self._part.shape.Orientation()
+
+    def is_reversed(self):
+        return self.orientation() == OCC.Core.TopAbs.TopAbs_Orientation.TopAbs_REVERSED
+
+    def is_forward(self):
+        return self.orientation() == OCC.Core.TopAbs.TopAbs_Orientation.TopAbs_FORWARD
 
 
 class PartSave:
@@ -1067,7 +1385,7 @@ class PartSave:
         w.setRootShape(part._subshapes.root_shape.set_placeable_shape.shape,
                        json.dumps(part._subshapes.root_shape.attributes.values))
 
-        for name, subshapes in part.subshapes.items():
+        for name, subshapes in part._subshapes.items():
             for s in subshapes:
                 w.appendShape(name, s.set_placeable_shape.shape, json.dumps(s.attributes.values))
 
@@ -1078,7 +1396,6 @@ class PartSave:
         PartSave._validate_ocaf_path(path)
 
         w = ocaf_wrapper_swig.OcafWrapper(path + ".part.cbf")
-
         w.load()
 
         root_shape = w.getRootShape()
@@ -1128,6 +1445,27 @@ class PartSave:
         else:
             raise ValueError()
 
+
+class PartOrient:
+
+    def __init__(self, part: Part):
+        self._part = part
+
+    def forward(self) -> Part:
+        return self.value(OCC.Core.TopAbs.TopAbs_FORWARD)
+
+    def reversed(self):
+        return self.value(OCC.Core.TopAbs.TopAbs_REVERSED)
+
+    def value(self, new_orientation: OCC.Core.TopAbs.TopAbs_Orientation) -> Part:
+        if not self._part.shape.Orientable():
+            raise ValueError("Part is not orientable")
+
+        new_shape = self._part.shape.Oriented(new_orientation)
+        # todo: how to keep associations of labelled edges/verts ??
+        return Part(
+            self._part.cache_token.mutated("oriented", new_orientation),
+            self._part.subshapes_with_updated_root_shape(new_shape))
 
 class PartArray:
 
@@ -1197,6 +1535,9 @@ class PartMake:
             # nothing to do
             return self._part
 
+        if self._part.inspect.is_solid():
+            raise ValueError("Part is already a solid, use explore to find the shell")
+
         if op.InterrogateUtils.is_singleton_compound(self._part.shape) and \
                 op.InterrogateUtils.is_compound_of(self._part.shape, OCC.Core.TopAbs.TopAbs_SHELL):
             return self._part.explore.shell.get()[0]
@@ -1221,10 +1562,10 @@ class PartMake:
                 return faces[0]
             else:
                 raise ValueError("Part is a shell consisting of != 1 face. Cannot reduce to a single face.")
+        elif self._part.inspect.is_edge():
+            return self._part.make.wire().make.face()
         elif op.InterrogateUtils.is_compound_of(self._part.shape, OCC.Core.TopAbs.TopAbs_EDGE):
-            return op.WireSketcher.from_edges(*set(op.Explorer.edge_explorer(self._part.shape).get()), tolerance=0.001)\
-                .close()\
-                .get_face_part()
+            return self._part.make.wire().make.face()
         elif op.InterrogateUtils.is_singleton_compound(self._part.shape) and \
             op.InterrogateUtils.is_compound_of(self._part.shape, OCC.Core.TopAbs.TopAbs_FACE):
             return self._part.explore.face.get()[0]
@@ -1248,15 +1589,15 @@ class PartMake:
                                     p.cache_token.mutated("make", "wire"),
                                     OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeWire(p.shape),
                                     map_is_partner=True))
-        elif self._part.shape.ShapeType() == OCC.Core.TopAbs.TopAbs_COMPOUND:
-            #if any(e.ShapeType() != OCC.Core.TopAbs.TopAbs_EDGE for e in edges):
-            #    raise ValueError("Can only create a wire from a compound of edges")
+        elif self._part.inspect.is_compound_of(OCC.Core.TopAbs.TopAbs_EDGE):
+            if op.InterrogateUtils.is_singleton_compound(self._part.shape):
+                return self._part.explore.edge.get_single().make.wire()
 
-            mkw = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeWire()
-            mkw.Add(op.ListUtils.list([s for s in op.InterrogateUtils.traverse_all_subshapes(self._part.shape) if s.ShapeType() == TopAbs_EDGE]))
-            mkw.Build()
+            import ezocc.alg.adjacent_edges_to_wire
+            result = self._part.bool.union()# merge overlapping vertices
+            wire = ezocc.alg.adjacent_edges_to_wire.merge_adjacent_edges(result)
 
-            return self._part.perform_make_shape(self._part.cache_token.mutated("make", "wire"), mkw)
+            return wire
 
         wires = self._part.explore.wire.get()
 
@@ -1274,6 +1615,41 @@ class PartCleanup:
     def build_curves_3d(self) -> Part:
         op.GeomUtils.build_curves_3d(self._part.shape)
         return self._part
+
+    # todo: I created this when struggling with adjusting wire orientations, however cleanup(concat_b_splines=True)
+    # seems to have corrected the issue. Leaving this here for now in case it turns out to be needed in future.
+    def _make_wire_orientation_continuous(self) -> Part:
+        if not self._part.inspect.is_wire():
+            raise ValueError("Part is not a wire")
+        
+        # get the edge sequence 
+        edges_in_order = self._part.explore.explore_wire_edges_ordered().get()
+        
+        edge_mutations = {
+            e.set_placeable_shape: e for e in edges_in_order
+        }
+        
+        new_edges = [edges_in_order[0]]
+        
+        # for each edge
+        # check if edge v1 == next edge v0, if not the edge becomes reversed
+        for i in range(0, len(edges_in_order) - 1):
+            edge_from = edges_in_order[i]
+            edge_to = edges_in_order[i + 1]
+            
+            dist = OCC.Core.gp.gp_Pnt(*edge_from.explore.vertex.get()[1].xts.xyz_mid)\
+                .Distance(OCC.Core.gp.gp_Pnt(*edge_to.explore.vertex.get()[0].xts.xyz_mid))
+
+            if dist > OCC.Core.Precision.precision_Confusion():
+                edge_mutations[edge_to.set_placeable_shape] = edge_to.oriented.reversed()
+            else:
+                edge_mutations[edge_to.set_placeable_shape] = edge_to
+
+        result = PartFactory(self._part.cache_token.get_cache()).compound(
+            *edge_mutations.values()
+        ).make.wire()
+
+        return result
 
     # note: general cleanup probably required after this as wires may not be connected
     def fuse_wires(self) -> Part:
@@ -1350,11 +1726,33 @@ class PartExplorer:
     to just re-implement it here.
     """
 
-    def __init__(self, part: Part, shape_type: typing.Optional[OCC.Core.TopAbs.TopAbs_ShapeEnum]):
+    def __init__(self,
+                 part: Part,
+                 explore_method,
+                 shape_type: typing.Optional[OCC.Core.TopAbs.TopAbs_ShapeEnum]):
         self._part = part
+        self._explore_method = explore_method
         self._shape_type = shape_type
         self._predicate: typing.Callable[[Part], bool] = lambda p: True
         self._key: typing.Callable[[Part], float] = lambda p: 0.0
+
+    def get_x_max(self):
+        return self.get_max(lambda f: f.xts.x_mid)
+
+    def get_y_max(self):
+        return self.get_max(lambda f: f.xts.y_mid)
+
+    def get_z_max(self):
+        return self.get_max(lambda f: f.xts.z_mid)
+
+    def get_x_min(self):
+        return self.get_min(lambda f: f.xts.x_mid)
+
+    def get_y_min(self):
+        return self.get_min(lambda f: f.xts.y_mid)
+
+    def get_z_min(self):
+        return self.get_min(lambda f: f.xts.z_mid)
 
     def get_max(self, key: typing.Callable[[Part], float]) -> Part:
         return self.order_by(key).get()[-1]
@@ -1372,14 +1770,41 @@ class PartExplorer:
         self._key = key
         return self
 
+    def __iter__(self):
+        return self.get().__iter__()
+
+    def get_any(self) -> Part:
+        result = self.get()
+
+        if len(result) == 0:
+            raise ValueError("Expected result of explore to be at least one element, instead was zero")
+
+        return result[0]
+
     def get(self) -> typing.List[Part]:
+        explore_results = self._explore_method(self._part.shape, self._shape_type) if self._shape_type is not None \
+            else self._explore_method(self._part.shape)
+
+        def _find_subshape(s: OCC.Core.TopoDS.TopoDS_Shape):
+            existing = self._part.subshapes.find_annotated_shapes(op.SetPlaceableShape(s))
+
+            if len(existing) == 0:
+                return AnnotatedShape(s)
+            else:
+                return [*existing][0]
+
         result = [Part(
-            self._part.cache_token.mutated("explore", self._shape_type, i),
-            self._part.subshapes.with_updated_root_shape(s)) for i, s in
-                  enumerate(op.ExploreUtils.explore_iterate(self._part.shape, self._shape_type))]
+            self._part.cache_token.mutated("explore", s),
+            self._part.subshapes_with_updated_root_shape(_find_subshape(s))) for i, s in
+                  enumerate(explore_results)]
         result = [p for p in result if self._predicate(p)]
         result.sort(key=self._key)
         return result
+
+    def get_compound(self) -> Part:
+        result = self.get()
+
+        return PartFactory(self._part.cache_token.get_cache()).compound(*result)
 
     def get_single(self) -> Part:
         result = self.get()
@@ -1391,35 +1816,35 @@ class PartExplorer:
 
     @staticmethod
     def solid_explorer(part: Part):
-        return PartExplorer(part, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_SOLID)
+        return PartExplorer(part, op.ExploreUtils.explore_iterate, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_SOLID)
 
     @staticmethod
     def shell_explorer(part: Part):
-        return PartExplorer(part, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_SHELL)
+        return PartExplorer(part, op.ExploreUtils.explore_iterate, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_SHELL)
 
     @staticmethod
     def face_explorer(part: Part):
-        return PartExplorer(part, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_FACE)
+        return PartExplorer(part, op.ExploreUtils.explore_iterate, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_FACE)
 
     @staticmethod
     def vertex_explorer(part: Part):
-        return PartExplorer(part, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_VERTEX)
+        return PartExplorer(part, op.ExploreUtils.explore_iterate, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_VERTEX)
 
     @staticmethod
     def edge_explorer(part: Part):
-        return PartExplorer(part, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_EDGE)
+        return PartExplorer(part, op.ExploreUtils.explore_iterate, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_EDGE)
 
     @staticmethod
     def wire_explorer(part: Part):
-        return PartExplorer(part, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_WIRE)
+        return PartExplorer(part, op.ExploreUtils.explore_iterate, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_WIRE)
 
     @staticmethod
     def shape_explorer(part: Part):
-        return PartExplorer(part, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_SHAPE)
+        return PartExplorer(part, op.ExploreUtils.explore_iterate, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_SHAPE)
 
     @staticmethod
     def compound_explorer(part: Part):
-        return PartExplorer(part, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_COMPOUND)
+        return PartExplorer(part, op.ExploreUtils.explore_iterate, OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_COMPOUND)
 
 
 class PartExplore:
@@ -1427,10 +1852,52 @@ class PartExplore:
     def __init__(self, part: Part):
         self._part = part
 
+    @property
+    def vertex(self) -> PartExplorer:
+        return PartExplorer.vertex_explorer(self._part)
+
+    @property
+    def edge(self) -> PartExplorer:
+        return PartExplorer.edge_explorer(self._part)
+
+    @property
+    def wire(self) -> PartExplorer:
+        return PartExplorer.wire_explorer(self._part)
+
+    @property
+    def face(self) -> PartExplorer:
+        return PartExplorer.face_explorer(self._part)
+
+    @property
+    def shell(self) -> PartExplorer:
+        return PartExplorer.shell_explorer(self._part)
+
+    @property
+    def solid(self) -> PartExplorer:
+        return PartExplorer.solid_explorer(self._part)
+
+    @property
+    def compound(self) -> PartExplorer:
+        return PartExplorer.compound_explorer(self._part)
+
     def __getattr__(self, item) -> PartExplorer:
         explore_method = getattr(PartExplorer, f"{item}_explorer")
 
         return explore_method(self._part)
+
+    @property
+    def direct_subshapes(self):
+        def explore_method(shape):
+            return [s for s in op.InterrogateUtils.traverse_direct_subshapes(shape)]
+
+        return PartExplorer(self._part,
+                            explore_method,
+                            None)
+
+    def explore_wire_edges_ordered(self):
+        return PartExplorer(self._part,
+                            op.ExploreUtils.ordered_wire_explore_iterate,
+                            OCC.Core.TopAbs.TopAbs_EDGE)
 
 
 class PartExtruder:
@@ -1587,7 +2054,7 @@ class PartExtruder:
             if remake_solid and self._part.inspect.is_solid():
                 result = result.make.solid()
 
-            return result
+            return result.with_cache_token(new_token)
 
         return self._part.cache_token.get_cache().ensure_exists(
             new_token,
@@ -1658,7 +2125,7 @@ class PartExtruder:
             spine = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeFace(spine_pln).Shape()
 
         token = self._part.cache_token.mutated("offset", amount, join_type, is_open_result,
-                                               spine if spine is None else UtilWrapper.shape_to_string(spine))
+                                               spine if spine is None or isinstance(spine, gp.gp_Ax2) else UtilWrapper.shape_to_string(spine))
 
         result: typing.Optional[Part] = None
 
@@ -1758,7 +2225,7 @@ class PartExtruder:
             for s in op.InterrogateUtils.traverse_all_subshapes(self._part.shape):
                 for ss in op.ListUtils.iterate_list(mkp.Generated(s)):
                     if AnnotatedShape(ss) not in extra_shapes[loft_profile_name]:
-                        extra_shapes[loft_profile_name].append(AnnotatedShape(ss))
+                        extra_shapes[loft_profile_name] = extra_shapes.get(last_shape_name, set()).union({AnnotatedShape(ss)})
 
         new_subshapes = result.subshapes
         for name, shapes in extra_shapes.items():
@@ -1800,6 +2267,9 @@ class PartTransformer:
 
     def rx(self, angle: float, offset: typing.Tuple[float, float, float] = None) -> Part:
         return self.rotate(gp.gp.OX(), angle, offset)
+
+    def r_xy_to_xz(self, offset: typing.Tuple[float, float, float] = None):
+        return self.rx(math.radians(90), offset)
 
     def ry(self, angle: float, offset: typing.Tuple[float, float, float] = None) -> Part:
         return self.rotate(gp.gp.OY(), angle, offset)
@@ -1894,7 +2364,7 @@ class PartBool:
                                  f"this shape has type {self._part.shape}")
 
             tools = [Part(self._part.cache_token.mutated("boolop", "union", s),
-                          self._part.subshapes.with_updated_root_shape(s)) for s in op.InterrogateUtils.traverse_direct_subshapes(self._part.shape)]
+                          self._part.subshapes_with_updated_root_shape(s)) for s in op.InterrogateUtils.traverse_direct_subshapes(self._part.shape)]
 
             return self._boolop(self._part.cache_token.mutated("boolop", "union_single", tools[0:1], tools[1:], glue, str(fuse)),
                                 fuse,
@@ -1938,6 +2408,11 @@ class PartBool:
                             [p for p in others],
                             glue)
 
+    def intersects(self, other: Part, glue: typing.Optional[OCC.Core.BOPAlgo.BOPAlgo_GlueEnum] = None) -> bool:
+        common = self.common(other, glue=glue)
+
+        return not op.InterrogateUtils.is_empty_compound(common.shape)
+
     def _boolop(self,
                 cache_token: CacheToken,
                 algo: OCC.Core.BRepAlgoAPI.BRepAlgoAPI_BooleanOperation,
@@ -1979,7 +2454,7 @@ class PartBool:
 
             shape = algo.Shape()
 
-            union_subshapes = self._part.subshapes.with_updated_root_shape(shape)
+            union_subshapes = self._part.subshapes_with_updated_root_shape(shape)
             for p in args:
                 union_subshapes.merge(p.subshapes.map_subshape_changes(union_subshapes.root_shape, mks=algo))
 
@@ -2002,37 +2477,46 @@ class PartBool:
 
         return cache_token.get_cache().ensure_exists(cache_token, _do)
 
+
 class PartMirror:
 
     def __init__(self, part: Part):
         self._part = part
 
-    def x(self, union: bool = False, center_x: float = 0):
-        result = PartTransformer(self._part)(
-            lambda t: t.SetMirror(gp.gp.YOZ().Translated(gp.gp_Vec(center_x, 0, 0))))
-
+    def _union_if_needed(self, result: Part, union: bool) -> Part:
         if union:
             return PartBool(self._part).union(result)
         else:
             return result
+
+    def axis(self,
+             dir: typing.Tuple[float, float, float],
+             offset: typing.Tuple[float, float, float] = (0, 0, 0),
+             union: bool = False):
+
+        result = PartTransformer(self._part)(
+            lambda t: t.SetMirror(gp.gp_Ax2(gp.gp_Pnt(*offset), gp.gp_Dir(gp.gp_Vec(*dir).Normalized())))
+        )
+
+        return self._union_if_needed(result, union)
+
+    def x(self, union: bool = False, center_x: float = 0):
+        result = PartTransformer(self._part)(
+            lambda t: t.SetMirror(gp.gp.YOZ().Translated(gp.gp_Vec(center_x, 0, 0))))
+
+        return self._union_if_needed(result, union)
 
     def y(self, union: bool = False, center_y: float = 0):
         result = PartTransformer(self._part)(
             lambda t: t.SetMirror(gp.gp.ZOX().Translated(gp.gp_Vec(0, center_y, 0))))
 
-        if union:
-            return PartBool(self._part).union(result)
-        else:
-            return result
+        return self._union_if_needed(result, union)
 
     def z(self, union: bool = False, center_z: float = 0):
         result = PartTransformer(self._part)(
             lambda t: t.SetMirror(gp.gp.XOY().Translated(gp.gp_Vec(0, 0, center_z))))
 
-        if union:
-            return PartBool(self._part).union(result)
-        else:
-            return result
+        return self._union_if_needed(result, union)
 
 
 class Fillet2dDefaultVertSelector:
@@ -2068,6 +2552,11 @@ class Fillet2dDefaultVertSelector:
 T = typing.TypeVar("T")
 class PartFilleter:
 
+    VERTEX_SELECTOR_TYPE = typing.Optional[typing.Union[
+        typing.Callable[[OCC.Core.TopoDS.TopoDS_Vertex], bool],
+        typing.Set[typing.Union[OCC.Core.TopoDS.TopoDS_Vertex, Part]]
+    ]]
+
     EDGE_SELECTOR_TYPE = typing.Optional[typing.Union[
         typing.Callable[[OCC.Core.TopoDS.TopoDS_Edge], bool],
         typing.Set[typing.Union[OCC.Core.TopoDS.TopoDS_Edge, Part]]
@@ -2083,8 +2572,6 @@ class PartFilleter:
                             typing.Callable[[T], bool],
                             typing.Set[T]
                          ]] = None) -> typing.Callable[[T], bool]:
-
-        print(selector)
 
         def select_on_part(shape):
             s0 = op.SetPlaceableShape(shape)
@@ -2147,23 +2634,11 @@ class PartFilleter:
 
     def fillet2d_verts(self,
                        radius: float,
-                       vert_selector: typing.Tuple[
-                           str,
-                           typing.Callable[[OCC.Core.TopoDS.TopoDS_Vertex], bool]] = None) -> Part:
-        if isinstance(vert_selector, str):
-            verts_to_allow = set(s.set_placeable_shape.shape for s in self._part.subshapes.get(vert_selector))
+                       vert_selector: VERTEX_SELECTOR_TYPE = None) -> Part:
 
-            def vert_selector(vert):
-                return vert in verts_to_allow
+        vert_selector = PartFilleter._create_selector(vert_selector)
 
-        if vert_selector is None:
-            all_edges = op.Explorer.edge_explorer(self._part.shape).get()
-            vert_selector = Fillet2dDefaultVertSelector(all_edges, all_edges)
-
-        if self._part.shape.ShapeType() == OCC.Core.TopAbs.TopAbs_WIRE:
-            result = self._part.make.face()
-        else:
-            result = self._part
+        result = self._part.make.face()
 
         mkf = OCC.Core.BRepFilletAPI.BRepFilletAPI_MakeFillet2d(result.shape)
 
@@ -2273,7 +2748,7 @@ class PartFilleter:
 
         edge_list = []
 
-        shapes = [s for n in names for s in self._part.get(n)] #[s for n in self._part.get(n) for n in names]
+        shapes = [s.shape for n in names for s in self._part.subshapes.get(n)] #[s for n in self._part.get(n) for n in names]
         for s in shapes:
             if s.ShapeType() != OCC.Core.TopAbs.TopAbs_EDGE:
                 raise ValueError("Shape is not an edge")
@@ -2304,29 +2779,29 @@ class PartAligner:
         com = op.InterrogateUtils.center_of_mass(self._part.shape)
         return self._part.transform.translate(-com[0], -com[1], -com[2])
 
-    def com(self, other: Part):
+    def com(self, other: Part) -> Part:
         other_com = op.InterrogateUtils.center_of_mass(other.shape)
         return self.com_to_origin().transform.translate(*other_com)
 
-    def stack_x0(self, part: Part, offset: float = 0):
+    def stack_x0(self, part: Part, offset: float = 0) -> Part:
         return self.x_max_to_min(part).transform.translate(dx=offset)
 
-    def stack_x1(self, part: Part, offset: float = 0):
+    def stack_x1(self, part: Part, offset: float = 0) -> Part:
         return self.x_min_to_max(part).transform.translate(dx=offset)
 
-    def stack_y0(self, part: Part, offset: float = 0):
+    def stack_y0(self, part: Part, offset: float = 0) -> Part:
         return self.y_max_to_min(part).transform.translate(dy=offset)
 
-    def stack_y1(self, part: Part, offset: float = 0):
+    def stack_y1(self, part: Part, offset: float = 0) -> Part:
         return self.y_min_to_max(part).transform.translate(dy=offset)
 
-    def stack_z0(self, part: Part, offset: float = 0):
+    def stack_z0(self, part: Part, offset: float = 0) -> Part:
         return self.z_max_to_min(part).transform.translate(dz=offset)
 
-    def stack_z1(self, part: Part, offset: float = 0):
+    def stack_z1(self, part: Part, offset: float = 0) -> Part:
         return self.z_min_to_max(part).transform.translate(dz=offset)
 
-    def by(self, command, other: Part) -> Part:
+    def by(self, command: str, other: Part) -> Part:
         token = self._part.cache_token.mutated(
             "part_aligner", "align_by",
             self._subshape_names, command, other)
@@ -2375,7 +2850,7 @@ class PartAligner:
 
     def __getattr__(self, item: str) -> typing.Callable[[typing.Union[Part, OCC.Core.TopoDS.TopoDS_Shape]], Part]:
         if not PartAligner.align_re.fullmatch(item):
-            raise ValueError("Invalid attribute")
+            raise ValueError(f"Invalid attribute: \"{item}\" does not match pattern: {PartAligner.align_re}")
 
         align_args = item.split('_')
 
@@ -2429,12 +2904,68 @@ class PartLoft:
     def __init__(self, part: Part):
         self._part = part
 
+    def pipe_through_profiles(
+            self,
+            profiles: typing.List[Part],
+            transition_mode: OCC.Core.BRepBuilderAPI.BRepBuilderAPI_TransitionMode =
+                OCC.Core.BRepBuilderAPI.BRepBuilderAPI_TransitionMode.BRepBuilderAPI_RightCorner,
+            bi_normal_mode: gp.gp_Dir = None,
+            aux_spine: typing.Optional[Part] = None):
+
+        spine = self._part
+
+        if spine.inspect.is_edge():
+            spine = spine.make.wire()
+
+        if not spine.inspect.is_wire():
+            raise ValueError(f"Spine is not a wire (was instead {Humanize.shape_type(spine.shape.ShapeType())})")
+
+        if len(profiles) == 0:
+            raise ValueError("At least one profile must be specified")
+
+        if bi_normal_mode is not None and aux_spine is not None:
+            raise ValueError("At most one of bi_normal_mode and aux_spine may be specified")
+
+        binorm_cache = None if bi_normal_mode is None else (bi_normal_mode.X(), bi_normal_mode.Y(), bi_normal_mode.Z())
+
+        token = self._part.cache_token.mutated("loft", "pipe_through_profiles", aux_spine, transition_mode, binorm_cache)
+
+        def _do():
+            mps = OCC.Core.BRepOffsetAPI.BRepOffsetAPI_MakePipeShell(spine.shape)
+
+            for profile in profiles:
+                mps.Add(profile.shape)
+
+            mps.SetTransitionMode(transition_mode)
+
+            if bi_normal_mode is not None:
+                mps.SetMode(bi_normal_mode)
+
+            if aux_spine is not None:
+                mps.SetMode(aux_spine.shape, True)
+
+            if not mps.IsReady():
+                raise RuntimeError("PipeBuilder failure")
+
+            try:
+                mps.Build()
+            except RuntimeError as e:
+                raise RuntimeError("Exception during build, have you run BuildCurves3d ?", e)
+
+            mps.MakeSolid()
+
+            return self._part.perform_make_shape(token, mps)
+
+        return self._part.cache_token.get_cache().ensure_exists(token, _do)
+
     def pipe(self,
              spine_part: Part,
              transition_mode: OCC.Core.BRepBuilderAPI.BRepBuilderAPI_TransitionMode =
                 OCC.Core.BRepBuilderAPI.BRepBuilderAPI_TransitionMode.BRepBuilderAPI_RightCorner,
              bi_normal_mode: gp.gp_Dir = None,
-             aux_spine: typing.Optional[Part] = None):
+             aux_spine: typing.Optional[Part] = None,
+             first_shape_name: str = None,
+             last_shape_name: str = None):
 
         if not isinstance(spine_part, Part):
             raise ValueError(f"Spine should be of type Part (was: {type(spine_part)})")
@@ -2444,7 +2975,14 @@ class PartLoft:
 
         binorm_cache = None if bi_normal_mode is None else (bi_normal_mode.X(), bi_normal_mode.Y(), bi_normal_mode.Z())
 
-        token = self._part.cache_token.mutated("loft", "pipe", spine_part, aux_spine, transition_mode, binorm_cache)
+        token = self._part.cache_token.mutated("loft",
+                                               "pipe",
+                                               spine_part,
+                                               aux_spine,
+                                               transition_mode,
+                                               binorm_cache,
+                                               first_shape_name,
+                                               last_shape_name)
 
         def _do():
             spine = spine_part.shape
@@ -2471,7 +3009,16 @@ class PartLoft:
 
             mps.MakeSolid()
 
-            return self._part.perform_make_shape(token, mps)
+            named_subshapes = {}
+            if first_shape_name is not None:
+                named_subshapes[first_shape_name] = [mps.FirstShape()]
+
+            if last_shape_name is not None:
+                named_subshapes[last_shape_name] = [mps.LastShape()]
+
+            return Part(token,
+                        SubshapeMap.from_unattributed_shapes(mps.Shape(), named_subshapes)) \
+                .perform_make_shape(token, mps)
 
         return self._part.cache_token.get_cache().ensure_exists(token, _do)
 
@@ -2503,11 +3050,14 @@ class PartRevol:
 
     def about(self,
               ax: gp.gp_Ax1,
-              radians: float,
+              radians: float = None,
               offset: typing.Tuple[float, float, float] = None,
               symmetric: bool = False) -> Part:
 
         ax_params = ax.Direction().X(), ax.Direction().Y(), ax.Direction().Z()
+
+        if radians is None:
+            radians = math.radians(360)
 
         if offset is not None:
             ax = ax.Translated(gp.gp_Vec(*offset))
@@ -2585,8 +3135,70 @@ class PartFactory:
     def __init__(self, cache: PartCache):
         self._cache = cache
 
+    def with_endpoints_connected(self, wire_a: Part, wire_b: Part):
+        #wire_a = wire_a.tr.ry(math.radians(90))
+        #wire_b = wire_b.tr.ry(math.radians(90))
+
+        wire_a = wire_a.cleanup.fuse_wires()
+        wire_b = wire_b.cleanup.fuse_wires()
+
+        a_edges = wire_a.explore.explore_wire_edges_ordered().get()
+        b_edges = wire_b.explore.explore_wire_edges_ordered().get()
+
+        #a_verts = [v for e in a_edges for v in e.explore.vertex.get()]
+        #b_verts = [v for e in b_edges for v in e.explore.vertex.get()]
+
+        #marker = self.sphere(0.5)
+
+        #print("a_edges")
+        #print(wire_a.inspect.orientation())
+        #for e in a_edges:
+        #    print(e.inspect.orientation())
+
+        #print("b_edges")
+        #print(wire_b.inspect.orientation())
+        #for e in b_edges:
+        #    print(e.inspect.orientation())
+
+        #self.arrange(
+        #    wire_a, wire_b,
+        #    *[marker.align().by("xmidymidzmid", v) for v in a_verts], #for e in a_edges for v in e.explore.vertex.get()],
+        #    *[marker.align().by("xmidymidzmid", v) for v in b_verts] #for e in b_edges for v in e.explore.vertex.get()]
+        #).preview()
+
+        a = op.WireSketcher(*a_edges[0].explore.vertex.get()[0].xts.xyz_mid).line_to(*b_edges[0].explore.vertex.get()[0].xts.xyz_mid)\
+            .get_wire_part(self._cache)\
+            .explore.edge.get()[0]
+
+        b = op.WireSketcher(*a_edges[-1].explore.vertex.get()[-1].xts.xyz_mid).line_to(*b_edges[-1].explore.vertex.get()[-1].xts.xyz_mid)\
+            .get_wire_part(self._cache)\
+            .explore.edge.get()[0]
+
+        return self.compound(*wire_a.explore.edge.get(), *wire_b.explore.edge.get(), a, b).sew.edges().make.wire()
+
+    def conical_arrow(self,
+                      point_from: typing.Tuple[float, float, float],
+                      point_to: typing.Tuple[float, float, float]) -> Part:
+
+        point_to_point_dist = gp.gp_Pnt(*point_from).Distance(gp.gp_Pnt(*point_to))
+        head_length = point_to_point_dist / 5
+        cylinder_dia = point_to_point_dist / 10
+
+        result = self.cylinder(cylinder_dia / 2, point_to_point_dist - head_length)
+        result = result.bool.union(self.cone(cylinder_dia * 1.5 / 2, 0, head_length)
+                                   .align().by("xmidymidzminmax", result)).cleanup()
+
+
+        quat = gp.gp_Quaternion(gp.gp_Vec(gp.gp_Pnt(*point_from), gp.gp_Pnt(*point_to)), gp.gp_Vec(0, 0, point_to_point_dist))
+
+        trsf = gp.gp_Trsf()
+        trsf.SetTransformation(quat, gp.gp_Vec(*point_from))
+
+        return result.transform(trsf)
+
+
     def parabola(self, focal_dist: float, a1: float, a2: float):
-        parab = gp.gp_Parab(gp.gp_ZOX(), focal_dist)
+        parab = gp.gp_Parab(gp.gp.ZOX(), focal_dist)
 
         edge = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeEdge(parab, a1, a2).Edge()
         op.GeomUtils.build_curves_3d(edge)
@@ -2596,6 +3208,48 @@ class PartFactory:
         return self.compound(
             Part(self._cache.create_token("part_factory", "parabola", focal_dist, a1, a2), SubshapeMap.from_single_shape(edge)).name("curve"),
             focal_point)
+
+    def ellipse(self, r_major: float, r_minor: float) -> Part:
+        if r_major <= r_minor:
+            raise ValueError("r_major should be greater than r_minor")
+
+        ellipse = gp.gp_Elips(gp.gp.XOY(), r_major, r_minor)
+
+        edge = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeEdge(ellipse).Edge()
+        op.GeomUtils.build_curves_3d(edge)
+
+        # add vertexes for easy alignment based on foci
+        c = math.sqrt(r_major * r_major - r_minor * r_minor)
+        f0 = self.vertex(-c, 0, 0)
+        f1 = self.vertex(c, 0, 0)
+
+        return self.compound(
+            Part(self._cache.create_token("part_factory", "ellipse", r_major, r_minor),
+                 SubshapeMap.from_single_shape(edge)).name("curve"),
+            self.compound(f0, f1).name("foci"))
+
+    def circle_arc(self, radius: float, angle_radians_0: float, angle_radians_1: float):
+        return self.vertex(0, 0, 0).tr.mv(dx=radius)\
+            .do(lambda p: p.tr.rz(angle_radians_0))\
+            .revol.about(OCC.Core.gp.gp.OZ(), radians=angle_radians_1 - angle_radians_0)\
+            .do(lambda p: p.name_subshape(p.explore.vertex.get()[0], "v0").name_subshape(p.explore.vertex.get()[1], "v1"))
+
+
+    def torus(self, r_major: float, r_minor: float):
+
+        token = self._cache.create_token(inspect.getsource(PartFactory.torus), r_major, r_minor)
+
+        def _do():
+            shape = OCC.Core.BRepPrim.BRepPrim_Torus(r_major, r_minor).Shell()
+
+            part = Part(token, SubshapeMap.from_single_shape(shape)).make.solid()
+
+            return part \
+                .annotate("r_major", str(r_major)) \
+                .annotate("r_minor", str(r_minor)) \
+                .with_cache_token(token)
+
+        return self._cache.ensure_exists(token, _do)
 
     def angle_wire(self,
                    angle_radians: float,
@@ -2646,7 +3300,7 @@ class PartFactory:
         mkf = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeFace(outer_wire.shape)
 
         for w in inner_wires:
-            mkf.Add(w.make.wire().shape.Reversed())
+            mkf.Add(w.make.wire().shape)
 
         return Part(self._cache.create_token("part_factory", "face", mkf.Face()),
                     SubshapeMap.from_single_shape(mkf.Face()))
@@ -2745,11 +3399,14 @@ class PartFactory:
 
     def trapezoid(self,
                   height: float, l_top: float, l_bottom: float):
-        return op.WireSketcher(-l_bottom / 2, 0, 0) \
+        result = op.WireSketcher(-l_bottom / 2, 0, 0) \
             .line_to(x=l_bottom / 2) \
             .line_to(x=l_top / 2, y=height) \
-            .line_to(x=-l_top / 2) \
-            .close() \
+
+        if l_top > 0:
+            result = result.line_to(x=-l_top / 2)
+
+        return result.close() \
             .get_wire_part(self._cache)
 
     def helix_by_angle(self, height: float, radius: float, helix_angle: float):
@@ -2817,11 +3474,57 @@ class PartFactory:
             SubshapeMap.from_unattributed_shapes(OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeWire(edge).Wire())) \
             .align().z_min_to(z=0)
 
-    def cone(self,
-             r1: float, r2: float, height: float):
+    def cone(self, r1: float, r2: float,
+             height: typing.Optional[float] = None,
+             angle: typing.Optional[float] = None):
+
+        if height is None and angle is None:
+            raise ValueError("At least one of height/angle must be specified")
+
+        if height is not None and angle is not None:
+            raise ValueError("At most one of height/angle must be specified")
+
+        if angle is not None:
+            # calculate height from r0, r1
+            dx = abs(r1 - r2)
+            height = dx * math.tan(angle)
+
+        if r1 == r2:
+            raise ValueError("The two radii are identical, create a cylinder instead?")
+
         return Part(self._cache.create_token("part_factory", "cone", r1, r2, height),
                     SubshapeMap.from_unattributed_shapes(
                         OCC.Core.BRepPrimAPI.BRepPrimAPI_MakeCone(r1, r2, height).Shape()))
+
+    class CircleDriver(PartDriver):
+
+        def __init__(self, part: Part):
+            if not part.inspect.is_edge():
+                raise ValueError("Input part should be an edge")
+
+            curve_type = op.InterrogateUtils.curve_type(part.shape)
+
+            if curve_type != OCC.Core.GeomAbs.GeomAbs_CurveType.GeomAbs_Circle:
+                raise ValueError("Curve type should be a circle")
+
+            super().__init__(part)
+
+        def chord_length(self, angle: float):
+            return 2.0 * self.radius * math.sin(angle / 2)
+
+        @property
+        def radius(self) -> float:
+            curve_adaptor = OCC.Core.BRepAdaptor.BRepAdaptor_Curve(self._part.shape)
+
+            return curve_adaptor.Circle().Radius()
+
+        @property
+        def diameter(self) -> float:
+            return 2.0 * self.radius
+
+        @property
+        def circumference(self) -> float:
+            return 2.0 * math.pi * self.radius
 
     class PolygonDriver(PartDriver):
 
@@ -2882,9 +3585,9 @@ class PartFactory:
 
     def capsule(self, center_distance: float, diameter: float) -> Part:
         return op.WireSketcher().line_to(x=center_distance, is_relative=True) \
-            .circle_arc_to(0, -diameter, 0, radius=diameter / 2, is_relative=True, direction=gp.gp_Dir(0, 0, -1)) \
+            .circle_arc_to(0, -diameter, 0, radius=diameter / 2, is_relative=True, direction=gp.gp_Dir(0, 0, -1), shortest_curve=None) \
             .line_to(x=-center_distance, is_relative=True) \
-            .circle_arc_to(0, diameter, 0, radius=diameter / 2, is_relative=True, direction=gp.gp_Dir(0, 0, -1)) \
+            .circle_arc_to(0, diameter, 0, radius=diameter / 2, is_relative=True, direction=gp.gp_Dir(0, 0, -1), shortest_curve=None) \
             .close() \
             .get_face_part(self._cache) \
             .align().com_to_origin()
@@ -2907,12 +3610,24 @@ class PartFactory:
         token = self._cache.create_token("part_factory", "shell", *parts)
         return Part(token, subshape_map.with_updated_root_shape(result))
 
+    def indexed_compound(self, *parts: Part, prefix: typing.Optional[str] = None) -> Part:
+        if prefix is None:
+            prefix = ""
+
+        return self.compound(*[
+            p.name(f"{prefix}{i}") for i, p in enumerate(parts)
+        ])
+
     def compound(self, *parts: Part) -> Part:
         if len(parts) == 0:
             builder = OCC.Core.BRep.BRep_Builder()
             result = OCC.Core.TopoDS.TopoDS_Compound()
             builder.MakeCompound(result)
-            return Part(parts[0].cache_token.mutated("part_factory", "compound_of_single_element"), result)
+            return Part(self._cache.create_token("part_factory", "compound_of_zero_elements"),
+                        SubshapeMap.from_single_shape(result))
+
+        if len(parts) == 1 and isinstance(parts[0], list):
+            return self.compound(*parts[0])
 
         p = parts[0]
 
@@ -2952,12 +3667,42 @@ class PartFactory:
 
         token = self._cache.create_token("part_factory", "text", text, font_name, size, font_aspect, is_composite_curve)
 
+        logger.info("Note if running inside a docker container certain fonts may be missing. Use docker cp to copy "
+                    "any required fonts to the container, "
+                    "e.g. docker container cp /usr/share/fonts/opentype/ <CONTAINER NAME>:/usr/share/fonts")
+
         def _do():
             return Part(
                 token,
                 SubshapeMap.from_single_shape(OCC.Core.Addons.text_to_brep(text, font_name, font_aspect, size, is_composite_curve)))
 
         return self._cache.ensure_exists(token, _do)
+
+    def hex_lattice_verts(self,
+                          radius: float,
+                          rows: int,
+                          cols: int,
+                          truncate_odd_rows: bool = False):
+
+
+        col_spacing = radius
+        row_spacing = math.sqrt(3) * 0.5 * radius
+
+        verts = []
+
+        for row in range(0, rows):
+            y = row * row_spacing
+            x_offs = 0 if row % 2 == 0 else col_spacing * 0.5
+
+            for col in range(0, cols):
+                x = col * col_spacing + x_offs
+
+                if row % 2 != 0 and col == cols - 1 and truncate_odd_rows:
+                    continue
+
+                verts.append(self.vertex(x, y, 0))
+
+        return self.compound(*verts)
 
     def hex_lattice(self,
                     rows: int,
@@ -2981,7 +3726,7 @@ class PartFactory:
                                          cube_hex_effect_b,
                                          cube_hex_line_thickness,
                                          inspect.getsource(modifier_callback) if modifier_callback is not None else None,
-                                         inspect.getsource(PartFactory.hex_lattice))
+                                         inspect.getsource(PartFactory))
 
         def _do():
             if modifier_callback is None:
@@ -2989,6 +3734,11 @@ class PartFactory:
 
             base_polygon = self.polygon(hex_radius, 6)
             base_shape = Part.of_shape(base_polygon.sp("body").make.face().shape)
+
+            if cube_hex_line_thickness is None:
+                line_thickness = 2 * (grid_radius - hex_radius)
+            else:
+                line_thickness = cube_hex_line_thickness
 
             if cube_hex_effect_a:
                 top = base_polygon.sp("segment_0").explore.vertex.get()[0]
@@ -3002,13 +3752,11 @@ class PartFactory:
                     op.WireSketcher(*center.xts.xyz_mid).line_to(*bl.xts.xyz_mid).get_wire_part(self._cache),
                     op.WireSketcher(*center.xts.xyz_mid).line_to(*br.xts.xyz_mid).get_wire_part(self._cache)]
 
-                if cube_hex_line_thickness is None:
-                    line_thickness = 2 * (grid_radius - hex_radius)
+                if line_thickness != 0:
+                    cuts = [w.extrude.offset(line_thickness / 2, spine=gp.gp.XOY()).make.face() for w in cuts]
+                    base_shape = base_shape.bool.cut(*cuts)
                 else:
-                    line_thickness = cube_hex_line_thickness
-
-                cuts = [w.extrude.offset(line_thickness / 2, spine=gp.gp.XOY()).make.face() for w in cuts]
-                base_shape = base_shape.bool.cut(*cuts)
+                    base_shape = self.compound(*base_shape.explore.edge.get(), *self.union(*cuts).explore.edge.get())
 
             if cube_hex_effect_b:
                 top = base_polygon.sp("segment_1").explore.vertex.get()[0]
@@ -3022,13 +3770,11 @@ class PartFactory:
                     op.WireSketcher(*center.xts.xyz_mid).line_to(*bl.xts.xyz_mid).get_wire_part(self._cache),
                     op.WireSketcher(*center.xts.xyz_mid).line_to(*br.xts.xyz_mid).get_wire_part(self._cache)]
 
-                if cube_hex_line_thickness is None:
-                    line_thickness = 2 * (grid_radius - hex_radius)
+                if line_thickness != 0:
+                    cuts = [w.extrude.offset(line_thickness / 2, spine=gp.gp.XOY()).make.face() for w in cuts]
+                    base_shape = base_shape.bool.cut(*cuts)
                 else:
-                    line_thickness = cube_hex_line_thickness
-
-                cuts = [w.extrude.offset(line_thickness / 2, spine=gp.gp.XOY()).make.face() for w in cuts]
-                base_shape = base_shape.bool.cut(*cuts)
+                    base_shape = self.compound(*base_shape.explore.edge.get(), *self.union(*cuts).explore.edge.get())
 
             col_spacing = grid_radius * 3
             row_spacing = math.sqrt(3) * 0.5 * grid_radius
@@ -3048,9 +3794,15 @@ class PartFactory:
 
                     subpart = mc(row, c, subpart)
 
-                    subparts += subpart.explore.face.get()
+                    if line_thickness != 0:
+                        subparts += subpart.explore.face.get()
+                    else:
+                        subparts += subpart.explore.edge.get()
 
-            return self.compound(*subparts).with_cache_token(token)
+            if line_thickness == 0:
+                return self.union(*subparts).with_cache_token(token)
+            else:
+                return self.compound(*subparts).with_cache_token(token)
 
         return self._cache.ensure_exists(token, _do)
 
@@ -3141,31 +3893,85 @@ class PartFactory:
         else:
             return Part(token, SubshapeMap.from_unattributed_shapes(shape, {name: [shape]}))
 
-    @staticmethod
-    def x_line(length: float, symmetric: bool = False):
-        return op.WireSketcher().line_to(x=length).get_wire_part() \
+    def voronoi_facets_2d(self, points: typing.List[typing.Tuple[float, float]]):
+        vor = Voronoi(points)
+
+        facets = []
+        for region in vor.regions:
+            if -1 in region or len(region) == 0:
+                continue
+
+            verts = [vor.vertices[i] for i in region]
+
+            ws = op.WireSketcher(*verts[0], 0)
+            for v in verts[1:]:
+                ws = ws.line_to(*v)
+
+            ws.close()
+
+            face = ws.get_face_part(self._cache)\
+                .cleanup(concat_b_splines=True, fix_small_face=True).oriented.forward()
+            facets.append(face)
+
+        return self.compound(*facets)
+
+    def x_line(self, length: float, symmetric: bool = False):
+        return op.WireSketcher().line_to(x=length).get_wire_part(self._cache) \
             .do(lambda p: p.align().x_mid_to((0, 0, 0)) if symmetric else p)
 
-    @staticmethod
-    def y_line(length: float, symmetric: bool = False):
-        return op.WireSketcher().line_to(y=length).get_wire_part() \
+    def y_line(self, length: float, symmetric: bool = False):
+        return op.WireSketcher().line_to(y=length).get_wire_part(self._cache) \
             .do(lambda p: p.align().y_mid_to((0, 0, 0)) if symmetric else p)
 
-    @staticmethod
-    def z_line(length: float, symmetric: bool = False):
-        return op.WireSketcher().line_to(z=length).get_wire_part() \
+    def z_line(self, length: float, symmetric: bool = False):
+        return op.WireSketcher().line_to(z=length).get_wire_part(self._cache) \
             .do(lambda p: p.align().z_mid_to((0, 0, 0)) if symmetric else p)
+
+    def loft_with_holes(self,
+             faces: typing.List[Part],
+             is_solid: bool = True,
+             is_ruled: bool = True,
+             pres3d: float = 1.0e-6,
+             first_shape_name: str = None,
+             last_shape_name: str = None,
+             loft_profile_name: str = None):
+        """
+        Perform loft operations on the supplied faces, attempting to match holes
+        """
+
+        wire_count = len(faces[0].explore.wire.get())
+
+        if any(len(f.explore.wire.get()) != wire_count for f in faces):
+            raise ValueError("Faces have inconsistent numbers of holes")
+
+        lofts: typing.List[typing.List[Part]] = []
+        lofts += [[f.inspect.outer_wire() for f in faces]]
+
+        for i in range(1, wire_count):
+            lofts += [[f.explore.wire.get()[i] for f in faces]]
+
+        loft_parts = [
+            self.loft(l,
+                      is_solid=is_solid,
+                      is_ruled=is_ruled,
+                      pres3d=pres3d,
+                      first_shape_name=first_shape_name,
+                      last_shape_name=last_shape_name,
+                      loft_profile_name=loft_profile_name) for l in lofts]
+
+        return loft_parts[0].bool.cut(*loft_parts[1:])
 
     def loft(self,
              wires_or_faces: typing.List[Part],
              is_solid: bool = True,
              is_ruled: bool = True,
-             pres3d: bool = 1.0e-6,
+             pres3d: float = 1.0e-6,
              first_shape_name: str = None,
              last_shape_name: str = None,
-             loft_profile_name: str = None):
+             loft_profile_name: str = None) -> Part:
 
         ts = OCC.Core.BRepOffsetAPI.BRepOffsetAPI_ThruSections(is_solid, is_ruled, pres3d)
+        ts.CheckCompatibility(True)
 
         if len(wires_or_faces) < 2:
             raise ValueError("Must specify at least 2 wires")
@@ -3192,7 +3998,12 @@ class PartFactory:
                     for f in op.ListUtils.iterate_list(ts.Generated(e.shape)):
                         named_subshapes[loft_profile_name] += [f]
 
-        token = self._cache.create_token(ts.Shape())
+        try:
+            token = self._cache.create_token(ts.Shape())
+        except RuntimeError as e:
+            wires_or_faces[0].preview(*wires_or_faces[1:])
+            raise
+
         return Part(token,
                     SubshapeMap.from_unattributed_shapes(ts.Shape(), named_subshapes)) \
             .perform_make_shape(token, ts)
@@ -3266,7 +4077,21 @@ class PartFactory:
                 r_inner,
                 height,
                 top_wire_inner_name,
-                bottom_wire_inner_name))
+                bottom_wire_inner_name))\
+            .annotate("r_inner", str(r_inner))\
+            .annotate("r_outer", str(r_outer))
+
+    def stacked_cylinder(self, *rad_heights: typing.Tuple[float, float]) -> Part:
+        if len(rad_heights) == 0:
+            raise ValueError("At least one radius/height pair must be specified")
+
+        result = [self.cylinder(radius=rad_heights[0][0], height=rad_heights[0][1])]
+        for i in range(1, len(rad_heights)):
+            result.append(
+                self.cylinder(radius=rad_heights[i][0], height=rad_heights[i][1])
+                    .tr.mv(dz=result[-1].xts.z_max))
+
+        return self.union(*result).cleanup()
 
     def cylinder(self,
                  radius: float,
@@ -3357,14 +4182,35 @@ class PartFactory:
 
     def box_surrounding(self,
                         part: Part,
-                        x_clearance: float = 0,
-                        y_clearance: float = 0,
-                        z_clearance: float = 0) -> Part:
+                        x_clearance: float = None,
+                        y_clearance: float = None,
+                        z_clearance: float = None,
+                        x_length: float = None,
+                        y_length: float = None,
+                        z_length: float = None) -> Part:
+
+        def get_length(part_extents: float, clearance_arg: float = None, length_arg: float = None) -> float:
+            if clearance_arg is not None and length_arg is not None:
+                raise ValueError("clearance and height cannot be simultaneously specified")
+
+            if length_arg is not None:
+                result = length_arg
+            elif clearance_arg is not None:
+                result = part_extents + 2 * clearance_arg
+            else:
+                result = part_extents
+
+            if result == 0:
+                logger.warning(f"Length extent evaluated to zero, setting value to unity (1) as a 0 length box is not "
+                               f"allowed")
+                result = 1
+
+            return result
 
         return self.box(
-            dx=part.extents.x_span + 2 * x_clearance,
-            dy=part.extents.y_span + 2 * y_clearance,
-            dz=part.extents.z_span + 2 * z_clearance) \
+            dx=get_length(part.extents.x_span, x_clearance, x_length),
+            dy=get_length(part.extents.y_span, y_clearance, y_length),
+            dz=get_length(part.extents.z_span, z_clearance, z_length)) \
             .align().xyz_mid_to_mid(part)
 
     def box_centered_on(self, part: Part, dx: float, dy: float, dz: float,
@@ -3454,7 +4300,7 @@ class ShapeSpecifier:
         """
         :return: The set of shapes to be considered for filtering
         """
-        return PartExplorer(part, self._expected_shape_type).get()
+        return PartExplorer(part, op.ExploreUtils.explore_iterate, self._expected_shape_type).get()
 
 
 class ShapeFilter:
@@ -3754,7 +4600,7 @@ class PartPick:
     def __init__(self, part: Part):
         self._part = part
 
-    def from_dir(self, dx: float = 0, dy: float = 0, dz: float = 0):
+    def from_dir(self, dx: float = 0, dy: float = 0, dz: float = 0) -> PartPickResult:
         origin = self._part.xts.xyz_mid
 
         # get a number greater than the maximum possible length of the object
@@ -3768,7 +4614,7 @@ class PartPick:
 
     def dir(self,
             origin: typing.Tuple[float, float, float],
-            direction: typing.Tuple[float, float, float]):
+            direction: typing.Tuple[float, float, float]) -> PartPickResult:
         origin_pnt = OCC.Core.gp.gp_Pnt(*origin)
         direction_dir = OCC.Core.gp.gp_Dir(OCC.Core.gp.gp_Vec(*direction).Normalized())
 
@@ -3791,7 +4637,29 @@ class PartCast:
            direction: typing.Optional[OCC.Core.gp.gp_Dir] = None,
            tolerance: float = Precision.precision.Confusion()) -> Part:
 
-        return PartCast._project_to(self._part, part_to, direction, tolerance)
+        cache = self._part.cache_token.get_cache()
+
+        token = cache.create_token(self._part, part_to, direction, tolerance)
+
+        def _do():
+            return PartCast._project_to(self._part, part_to, direction, tolerance).with_cache_token(token)
+
+        return cache.ensure_exists(token, _do)
+
+    def get_distance_to(self, part_to: Part) -> float:
+        dist = OCC.Core.BRepExtrema.BRepExtrema_DistShapeShape(
+            self._part.shape,
+            part_to.shape)
+
+        dist.Perform()
+
+        if not dist.IsDone():
+            raise ValueError("Could not compute distance")
+
+        pnt_from = dist.PointOnShape1(1)
+        pnt_to = dist.PointOnShape2(1)
+
+        return pnt_from.Distance(pnt_to)
 
     @staticmethod
     def _project_to(part_from: Part,

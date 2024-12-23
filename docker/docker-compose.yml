@@ -13,4 +13,7 @@ services:
     security_opt:
       - seccomp:unconfined
     network_mode: host
-
+    deploy:
+      resources:
+        limits:
+          memory: 1000M

@@ -5,7 +5,7 @@ ARG THIRDPARTY_BUILD_TYPE=Release
 RUN apt-get update
 RUN DEBIAN_FRONTEND=noninteractive apt-get install -y wget libxmu-dev vim gdb libglu1-mesa-dev libgl1-mesa-dev libxmu-dev libxi-dev build-essential cmake libfreetype6-dev tk-dev python3-dev rapidjson-dev python3 git python3-pip libpcre2-dev
 RUN DEBIAN_FRONTEND=noninteractive apt-get install tk tcl tk-dev tcl-dev libx11-dev libxt-dev rapidjson-dev -y
-RUN pip3 install svgwrite numpy matplotlib PyQt5
+RUN pip3 install svgwrite numpy matplotlib
 RUN pip3 install setuptools~=59.6.0
 RUN pip3 install aqtinstall~=3.0.2
 
@@ -23,17 +23,19 @@ ENV QML2_IMPORT_PATH /opt/qt/${QT}/gcc_64/qml/
 # seems that this needed to be installed to get pyqt to work
 COPY ./requirements.txt /requirements.txt
 RUN pip3 install -r /requirements.txt
-RUN pip3 install PyQt5==5.15.4
 RUN apt-get install libqt5gui5 -y
 
 RUN mkdir /third_party
 WORKDIR /third_party
 
 # VTK
-RUN git clone --depth 1 --branch v9.1.0 https://github.com/Kitware/VTK.git
+RUN git clone --depth 1 --branch v9.4.0 https://github.com/Kitware/VTK.git
 WORKDIR ./VTK
+
 # replace AllValues with vtkAllValues in vtk source due to collision with OCCT
 RUN find . -type f -exec sed -i 's/AllValues/vtkAllValues/g' {} +
+# fix warning https://gitlab.kitware.com/vtk/vtk/-/issues/19563
+RUN sed -i 's/if (this->EnvironmentTexture \&\& this->EnvironmentTexture->GetCubeMap())/if (useSH \&\& this->EnvironmentTexture \&\& this->EnvironmentTexture->GetCubeMap())/g' Rendering/OpenGL2/vtkOpenGLRenderer.cxx
 RUN git status
 RUN mkdir build
 WORKDIR ./build
@@ -69,20 +71,20 @@ WORKDIR ../..
 
 # SWIG
 WORKDIR /third_party
-RUN wget http://prdownloads.sourceforge.net/swig/swig-4.1.1.tar.gz
-RUN tar -zxvf swig-4.1.1.tar.gz
-WORKDIR ./swig-4.1.1
+RUN wget http://prdownloads.sourceforge.net/swig/swig-4.2.1.tar.gz
+RUN tar -zxvf swig-4.2.1.tar.gz
+WORKDIR ./swig-4.2.1
 RUN ./configure && make -j4 && make install
 
 # OPENCASCADE
 WORKDIR /third_party
-RUN wget -O occt-7.7.2.tgz "https://git.dev.opencascade.org/gitweb/?p=occt.git;a=snapshot;h=cec1ecd0c9f3b3d2572c47035d11949e8dfa85e2;sf=tgz"
-RUN tar -zxvf occt-7.7.2.tgz
-WORKDIR /third_party/occt-cec1ecd
+RUN wget -O occt-7.8.1.tgz "https://git.dev.opencascade.org/gitweb/?p=occt.git;a=snapshot;h=bd2a789f15235755ce4d1a3b07379a2e062fdc2e;sf=tgz"
+RUN tar -zxvf occt-7.8.1.tgz
+WORKDIR /third_party/occt-bd2a789
 WORKDIR ./build
 RUN cmake .. \
     -DUSE_VTK=ON  \
-    -D3RDPARTY_VTK_INCLUDE_DIR=/usr/local/include/vtk-9.1/ \
+    -D3RDPARTY_VTK_INCLUDE_DIR=/usr/local/include/vtk-9.4/ \
     -D3RDPARTY_TCL_INCLUDE_DIR=/usr/include/tcl8.6 \
     -D3RDPARTY_TK_INCLUDE_DIR=/usr/include/tcl8.6 \
     -DBUILD_RELEASE_DISABLE_EXCEPTIONS=OFF \
@@ -94,7 +96,7 @@ RUN ldconfig
 
 # pythonocc
 WORKDIR /third_party
-RUN git clone --depth 1 --branch 7.7.2 https://github.com/tpaviot/pythonocc-core
+RUN git clone --depth 1 --branch 7.8.1 https://github.com/tpaviot/pythonocc-core
 WORKDIR ./pythonocc-core
 RUN mkdir build
 WORKDIR ./build
@@ -134,10 +136,14 @@ WORKDIR /wsp
 
 RUN echo '#!/bin/bash' > /entrypoint.sh
 RUN echo 'xauth add $DISPLAY $XAUTH_ADD_ARG' >> /entrypoint.sh
+RUN echo 'pip3 install -r /requirements.txt' >> /entrypoint.sh
 RUN echo 'pip3 install -e .' >> /entrypoint.sh
 RUN echo 'exec $@' >> /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 RUN cat /entrypoint.sh
+
+# uncomment to debug QT errors
+# ENV QT_DEBUG_PLUGINS=1
 
 ENTRYPOINT [ "/entrypoint.sh" ]
 CMD ["/bin/bash"]

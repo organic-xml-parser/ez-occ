@@ -1,16 +1,10 @@
 # EZ-OCC
-
 ## Examples
-
 ### Gears
-![screenshot](resources/gears.png)
-
-Parts store a hierarchy of shape data that persists between most operations.
-These labels and attributes can be used to group together parts along with
-their clearances (labelled parts are highlighted).
-
+![screenshot](resources/gears_0.png)
+Creating a Gear Pair
 ```python
-def gears(cache):
+def build(cache: PartCache):
     factory = PartFactory(cache)
     gears = InvoluteGearFactory(cache).create_involute_gear_pair(
         GearPairSpec.matched_pair(2, 10, 5, clearance=0.5), height=10)
@@ -27,13 +21,13 @@ def gears(cache):
     pinion = gears.sp("pinion", "body").bool.cut(shaft.align().by("xmidymid", gears.sp("pinion", "center")))
 
     return result.add(bull, pinion)
+
 ```
-
-### To create a bolt
-![screenshot](resources/bolt_m4.png)
+### M4 Bolt
+![screenshot](resources/bolt_0.png)
+Creating a Bolt
 ```python
-
-def bolt_m4(cache: PartCache):
+def build(cache: PartCache):
     factory = PartFactory(cache)
 
     thread_spec = ThreadSpec.metric("m4")
@@ -63,16 +57,16 @@ def bolt_m4(cache: PartCache):
             .extrude.prism(dz=-0.2))
 
     return factory.compound(head, body, thread)
+
 ```
-
-### Patterning the bolt, and building an enclosure with a shadow line
-![screenshot](resources/enclosure.png)
+### Enclosure
+![screenshot](resources/enclosure_0.png)
+Creating an Enclosure w. shadow line
 ```python
-
-def enclosure(cache: PartCache):
+def build(cache: PartCache):
     factory = PartFactory(cache)
 
-    bolt = bolt_m4(cache).preview().tr.ry(math.radians(90)).incremental_pattern(
+    bolt = mkbolt.build(cache).tr.ry(math.radians(90)).incremental_pattern(
         range(0, 4), lambda p: p.tr.mv(dy=p.xts.y_span + 2))
 
     result = factory.box_surrounding(bolt, 3, 3, 3)\
@@ -93,21 +87,19 @@ def enclosure(cache: PartCache):
     result = result.bool.cut(
         interface_cut.loft.pipe(
             spine,
-            transition_mode=OCC.Core.BRepBuilderAPI.BRepBuilderAPI_TransitionMode.BRepBuilderAPI_RoundCorner))\
+            transition_mode=BRepBuilderAPI.BRepBuilderAPI_TransitionMode.BRepBuilderAPI_RoundCorner))\
         .cleanup()
 
     bottom, top = result.explore.solid.order_by(lambda s: s.xts.z_max).get()
 
     return factory.arrange(bottom.add(bolt), top.tr.ry(math.radians(180)), spacing=3)
+
 ```
-
 ### Chess Piece
-![screenshot](resources/chess_piece.png)
+![screenshot](resources/chess_piece_0.png)
+Creating a Chess Piece
 ```python
-
-from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_MakePipeShell as mps
-
-def chess_piece(cache):
+def build(cache: PartCache):
     factory = PartFactory(cache)
 
     base = factory.square_centered(20, 20).fillet.fillet2d_verts(1).make.face()
@@ -146,21 +138,19 @@ def chess_piece(cache):
         .do(lambda f: f.fillet.chamfer_faces(1, f.sp("bottom")))
 
     return base.add(body, head)
+
 ```
-
-### Parabolic dish with lattice support
-![screenshot](resources/parabolic_dish_1.png)
-![screenshot](resources/parabolic_dish_2.png)
-Note: the lattice boolean operation is fairly slow (~=1m). 
-After caching the script runs on the order of seconds.
+### Dish
+![screenshot](resources/dish_0.png)
+![screenshot](resources/dish_1.png)
+Creating a Parabolic Dish w. Lattice Supports
 ```python
-
-def dish(cache):
+def build(cache):
     factory = PartFactory(cache)
 
     curve = factory.parabola(100, 0, 60)
 
-    inner = curve.sp("curve").revol.about(gp_OZ(), math.radians(360))
+    inner = curve.sp("curve").clear_subshape_map().revol.about(gp.OZ(), math.radians(360))
     outer = inner.extrude.make_thick_solid(4)
 
     rim = factory.loft([
@@ -180,118 +170,84 @@ def dish(cache):
 
     lattice_extrusion_thickness = 0.5
 
-    support_lattice = factory.lattice(9, 9, True, True) \
+    support_lattice = (factory.lattice(9, 9, True, True) \
         .tr.scale_to_x_span(result.xts.x_span - lattice_extrusion_thickness, scale_other_axes=True) \
-        .do(lambda p: factory.union(*[w.extrude.offset(lattice_extrusion_thickness, spine=gp_XOY()).make.face() for w in p.explore.wire.get()]))\
-        .sew.faces().cleanup()\
+        .do(lambda p: factory.union(*[w.extrude.offset(lattice_extrusion_thickness, spine=gp.XOY()).make.face() for w in p.explore.wire.get()])) \
+        .sew.faces().cleanup() \
         .align().by("xmidymidzmid", result) \
         .bool.common(result_perimeter.extrude.make_thick_solid(-2 * lattice_extrusion_thickness)) \
-        .cleanup()\
-        .extrude.prism(dz=result.xts.z_span + 2)\
-        .align().by("zmin", result).tr.mv(dz=-1)\
-        .bool.cut(result).explore.solid.get_min(lambda s: s.xts.z_min)\
+        .cleanup() \
+        .extrude.prism(dz=result.xts.z_span + 2) \
+        .align().by("zmin", result).tr.mv(dz=-1) \
+        .bool.cut(result) \
+        .explore.solid.get_min(lambda s: s.xts.z_min)\
         .bool.cut(factory.box_surrounding(result).align().stack_z0(result))\
         .add(factory.ring(result_perimeter.xts.x_span / 2, result_perimeter.xts.x_span / 2 - lattice_extrusion_thickness * 2, inner.xts.z_span)
                     .align().by("xmidymidzmin", result))\
-        .cleanup()
+        .cleanup())
 
     result = result.cleanup.fix_solid().add(support_lattice)
 
     return result.bool.cut(factory.box(10, 10, result.xts.z_span).align().by("xmidymidzmin", result))
 
 ```
-
 ## Project goals
-
 Primarily, this project is a python library that sits on top of pythonocc, which itself is a 
 wrapper around OCCT (Open CasCade Technology), which itself is a very large set of tools and 
 libraries for BRep ("Boundary Representation") modelling.
-
 BRep modelling is preferable for CAD/CAM applications, where the requirement for explicit 
 geometric definitions precludes mesh-based modelling (more common in CGI or artistic applications).
 An imprecise analogy would be comparing SVG vector graphics to PNG rasterization.
-
 OCCT is huge and quite powerful. Unfortunately it suffers from the limitations of hit-and-miss 
 documentation, older coding conventions, poor feature discoverability, and the occasional comment
 block written in French. All of these are easily offset by the fact that it is free and open source.
-
 pythonocc is an admirably transparent wrapper around OCCT, exposing most of it without 
 significant changes to the API, and adding a few extras, e.g. the viewer. OCCT entities such as the 
 ubiquitous library-specific smart pointer are abstracted away (mostly) without issue.
-
 This library attempts to provide a fluent API for performing tasks that would take hundreds 
 of lines of code if written in pythonocc alone. The eventual aim is to have something like OpenSCAD, 
 but with constraint based modelling and avoiding the DSL.
-
 There are a few other dependencies that I have not mentioned yet. VTK 
 (short for Visualization Tool Kit) is an OOP library based on OpenGL to automate the rendering of data sets 
 mostly aimed at STEM applications. The inbuilt viewer classes that come with OCC (there is a VTK one)
 were not customizable enough to be useful, so I had to implement my own. This issue has been a common 
 theme when working with these tools, and why I choose to build them from source vs. using prebuilt 
 packages from, for instance, apt.
-
 Finally there is Solvespace, which hasn't really been integrated
 very far but is intended to act as the geometric constraint solver (GCS) for when I get around to adding
 constraint based modelling.
-
 # Setup and Installation
-
 ## Requirements
-
 - Docker ~= 20.10.22
-
 ## Dev setup
-
 ### Create an Image
-
 There are quite a few dependencies and they can be quite tricky to get working together, 
 so the best way is to create a docker container. See [docker](./docker). You can create the image by:
-
 ```commandline
 # starting from project root
 
 pushd docker
 ./docker_build.sh
 ```
-
 The `Dockerfile` serves as documentation for how setup can be performed manually. Note that due 
 to the specific versions required, the dependencies are cloned and built from source. This will
 take quite a long time.
-
 ### To start the Container:
-
 ```commandline
 ./docker_run.sh
 ```
-
 On start the container will install the python project as an editable pip package,
 so any changes you make under `src` will have immediate effect.
 The project directory is mapped to container dir `/wsp`.
-
 To export files, e.g. `step`,`stl` you can use the project directory `output`, 
 which is mapped to the container directory `/wsp/output`.
-
 Due to the work which needs to be done at startup, you will probably want to
 pause the container instead of killing it.
-
 ### Running Projects
-
-By convention, executable projects are stored under the `projects` dir, it's simple to
-run them:
-
-```commandline
-# in container, starting from /wsp
-python3 projects/project_name.py
-```
-
-Since the library is under development and new features are added when needed, 
-older projects are less likely to work. Check the commit history for
-the most recent ones to have the best chance of them running correctly.
-
+A good place to start is the `examples` directory. It contains the scripts used to generate the screenshots for this 
+documentation
 ### Running Tests
-
 To run the meagre set of unit tests:
-
 ```commandline
 # in container, starting from /wsp
 ./run_tests.sh

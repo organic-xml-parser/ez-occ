@@ -17,6 +17,10 @@
 class UtilWrapper {
 public:
     static std::string shape_to_string(const TopoDS_Shape& shape);
+
+    static int shape_map_hasher_hash_code(const TopoDS_Shape& shape);
+
+    static bool shape_map_hasher_equal(const TopoDS_Shape& a, const TopoDS_Shape& b);
 };
 
 class SurfaceMapperWrapper {
@@ -33,4 +37,8 @@ public:
     static BRepBuilderAPI_MakeEdge project_curve_to_surface(
         const BRepAdaptor_Curve& edge,
         const BRepAdaptor_Surface& face);
+
+    static gp_Pnt2d project_point_to_surface(
+        const gp_Pnt& point,
+        const BRepAdaptor_Surface& surf);
 };

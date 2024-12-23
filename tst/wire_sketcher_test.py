@@ -131,7 +131,7 @@ class WireSketcherTest(unittest.TestCase):
 
         self.assertEqual(["test"], list(wire.subshapes.keys()))
 
-        result = wire.fillet.fillet2d_verts(1, "test")
+        result = wire.fillet.fillet2d_verts(1, {wire.sp("test")})
 
         # assert that an extra edge was added
         self.assertEqual(len(result.explore.edge.get()), 4)

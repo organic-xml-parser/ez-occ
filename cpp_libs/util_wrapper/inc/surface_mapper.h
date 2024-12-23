@@ -9,6 +9,8 @@
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <GeomLib_IsPlanarSurface.hxx>
 #include <ShapeConstruct_ProjectCurveOnSurface.hxx>
+#include <GeomAPI_ProjectPointOnSurf.hxx>
+#include <gp_Pnt2d.hxx>
 
 // todo: this is a workaround to a similar issue to: https://github.com/tpaviot/pythonocc-core/issues/1218
 class SurfaceMapperWrapper {
@@ -51,6 +53,19 @@ public:
         return BRepBuilderAPI_MakeEdge(
             opencascade::handle<Geom2d_Curve>::DownCast((*curve2d).Copy()),
             face.Surface().Surface());
+    }
+
+    static gp_Pnt2d project_point_to_surface(
+        const gp_Pnt& point,
+        const BRepAdaptor_Surface& surf) {
+
+        Standard_Real u;
+        Standard_Real v;
+
+        auto proj = GeomAPI_ProjectPointOnSurf(point, surf.Surface().Surface());
+        proj.LowerDistanceParameters(u, v);
+
+        return gp_Pnt2d(u, v);
     }
 
     static bool is_planar_surface(const BRepAdaptor_Surface& surface_adaptor) {

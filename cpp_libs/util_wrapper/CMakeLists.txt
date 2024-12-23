@@ -15,7 +15,7 @@ if (NOT OCC_FOUND)
     message(FATAL_ERROR "OCC Not found")
 endif()
 
-find_package(SWIG 4.0.0 REQUIRED)
+find_package(SWIG 4.1.1 REQUIRED)
 include(UseSWIG)
 
 message("OCE_FOUND? <${OCE_FOUND}>")

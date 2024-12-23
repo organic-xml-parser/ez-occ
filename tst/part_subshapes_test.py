@@ -1,3 +1,4 @@
+import logging
 import pdb
 import tempfile
 import unittest
@@ -10,6 +11,8 @@ from ezocc.part_cache import InMemoryPartCache
 from ezocc.part_manager import NoOpPartCache, PartFactory, PartSave
 
 import util_wrapper_swig
+
+from ezocc.subshape_mapping import SubshapeMap
 
 
 class TestPartSubshapes(unittest.TestCase):
@@ -30,17 +33,20 @@ class TestPartSubshapes(unittest.TestCase):
     #    gear_a_center_recovered = gear_a_recovered.single_subpart("center")
     #    gear_b_center_recovered = gear_b_recovered.single_subpart("center")
 
-    def test_do_on_single_subpart(self):
+    def test_place_conflicting_annotated_shape(self):
+        box = self._part_factory.box(10, 10, 10)
 
-        #box = self._part_factory.box(1, 1, 1)
-        #vert = self._part_factory.box(0, 0, 0)
-#
-        #builder = OCC.Core.BRep.BRep_Builder()
-        #result = OCC.Core.TopoDS.TopoDS_Compound()
-#
-        #builder.MakeCompound(result)
-        #builder.Add(result, box.shape)
-        #builder.Add(result, vert.shape)
+        face = box.pick.from_dir(1, 0, 0).first_face()
+
+        face_a = face.annotate("a", "b")
+        face_b = face.annotate("c", "d")
+
+        box = box.name_subshape(face_a, "face_a")
+
+        self.assertRaises(ValueError, lambda: box.name_subshape(face_b, "face_b"))
+
+
+    def test_do_on_single_subpart(self):
 
         gear_a = self._part_factory.cylinder(3, 1).name("body").add(self._part_factory.sphere(0.1).name("center"))
         gear_b = self._part_factory.cylinder(3, 1).name("body").add(self._part_factory.sphere(0.1).name("center")).tr.mv(dx=10)
@@ -67,3 +73,22 @@ class TestPartSubshapes(unittest.TestCase):
         self.assertNotEqual(
             SetPlaceableShape(gear_a.shape),
             SetPlaceableShape(gears.single_subpart("gear_a").shape))
+
+
+if __name__ == "__main__":
+    box = PartFactory(InMemoryPartCache()).box(10, 10, 10)
+
+    face = box.pick.from_dir(1, 0, 0).first_face()
+
+    face_a = face.annotate("a", "b")
+    face_b = face.annotate("c", "d")
+
+    face_a.print("FACE A")
+
+    logging.basicConfig(level=logging.DEBUG)
+
+    box = box.name_subshape(face_a, "face_a")
+
+    box.print("BOX")
+
+    box = box.name_subshape(face_b, "face_b")

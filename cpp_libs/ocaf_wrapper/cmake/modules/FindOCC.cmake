@@ -1,3 +1,5 @@
+# Note: taken from freecad repo: https://raw.githubusercontent.com/FreeCAD/FreeCAD/refs/heads/main/cMake/FindOCC.cmake
+
 # Try to find OCE / OCC
 # Once done this will define
 #
@@ -127,8 +129,6 @@ if(OCC_FOUND)
     TKG2d
     TKG3d
     TKMath
-    TKIGES
-    TKSTL
     TKShHealing
     TKXSBase
     TKBool
@@ -139,10 +139,6 @@ if(OCC_FOUND)
     TKGeomBase
     TKOffset
     TKPrim
-    TKSTEPBase
-    TKSTEPAttr
-    TKSTEP209
-    TKSTEP
     TKHLR
     TKFeat
   )
@@ -154,17 +150,20 @@ if(OCC_FOUND)
     TKLCAF
     TKVCAF
     TKCDF
-    TKXDESTEP
-    TKXDEIGES
     TKMeshVS
     TKService
     TKV3d
   )
-  if(OCC_VERSION_STRING VERSION_LESS 6.7.3)
-    list(APPEND OCC_OCAF_LIBRARIES TKAdvTools)
-  elseif(NOT OCC_VERSION_STRING VERSION_LESS 7.5.0)
+
+  if(NOT OCC_VERSION_STRING VERSION_LESS 7.5.0)
     list(APPEND OCC_OCAF_LIBRARIES TKRWMesh)
-  endif(OCC_VERSION_STRING VERSION_LESS 6.7.3)
+  endif(NOT OCC_VERSION_STRING VERSION_LESS 7.5.0)
+  if(OCC_VERSION_STRING VERSION_LESS 7.8.0)
+    list(APPEND OCC_LIBRARIES TKIGES TKSTL TKSTEPBase TKSTEPAttr TKSTEP209 TKSTEP)
+    list(APPEND OCC_OCAF_LIBRARIES TKXDESTEP TKXDEIGES)
+  else(OCC_VERSION_STRING VERSION_LESS 7.8.0)
+    list(APPEND OCC_LIBRARIES TKDESTEP TKDEIGES TKDEGLTF TKDESTL)
+  endif(OCC_VERSION_STRING VERSION_LESS 7.8.0)
   message(STATUS "-- Found OCE/OpenCASCADE version: ${OCC_VERSION_STRING}")
   message(STATUS "-- OCE/OpenCASCADE include directory: ${OCC_INCLUDE_DIR}")
   message(STATUS "-- OCE/OpenCASCADE shared libraries directory: ${OCC_LIBRARY_DIR}")

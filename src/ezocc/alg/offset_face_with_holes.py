@@ -8,7 +8,7 @@ import OCC.Core.TopoDS
 import OCC.Core.TopAbs
 
 from ezocc.occutils_python import InterrogateUtils
-from ezocc.part_manager import Part
+from ezocc.part_manager import Part, PartFactory
 
 
 def offset_face_with_holes(face: Part,
@@ -17,40 +17,22 @@ def offset_face_with_holes(face: Part,
     if not face.inspect.is_face():
         raise ValueError("Input must be a face")
 
+    factory = PartFactory(face.cache_token.get_cache())
+
     wires = face.explore.wire.get()
 
     if len(wires) == 1:
         return face.extrude.offset(amount=amount, join_type=join_type).make.face()
-    else:
-        mko = OCC.Core.BRepOffsetAPI.BRepOffsetAPI_MakeOffset(face.shape, join_type)
 
-        for w in wires[1:]:
-            mko.AddWire(w.shape)
+    def normalize_wire(wire: Part):
+        edges = [w.oriented.forward() for w in wire.explore.edge.get()]
+        return factory.compound(*edges).make.wire()
 
-        mko.Perform(amount)
+    outer_profile = normalize_wire(wires[0]).make.face().extrude.offset(amount).make.face()
 
-        offset_wires = face.perform_make_shape(face.cache_token.mutated("offset_face_with_holes", amount, join_type), mko)
+    inner_faces = [normalize_wire(w).extrude.offset(amount=-amount, join_type=join_type).make.face() for w in wires[1:]]
 
-        offset_wires = offset_wires.explore.wire.get()
-        #print("ORIENTATIONS WIRES")
-        #for w in offset_wires:
-        #    print(f"o={w.shape.Orientation()}")
-        #    print(f"of={w.make.face().shape.Orientation()}")
-
-        #offset_faces = [w.make.face() for w in offset_wires]
-        #print("ORIENTATIONS FACES")
-        #for w in offset_faces:
-        #    print(f"o={w.shape.Orientation()}")
-        #    print(f"of={w.make.face().shape.Orientation()}")
-
-        mkf = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeFace(offset_wires[0].shape)
-        for w in offset_wires[1:]:
-            mkf.Add(w.shape)
-
-        result = face.perform_make_shape(face.cache_token.mutated("offset_face_with_holes", amount, join_type), mkf)\
-            .cleanup(concat_b_splines=True, fix_small_face=True)
-
-        return result
+    return outer_profile.bool.cut(*inner_faces)
 
 
 def offset_holes_in_face(face: Part,

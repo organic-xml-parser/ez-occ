@@ -63,9 +63,12 @@ class TransformFactory:
 
         # default edge to act as coordinate origin
         edge = edge_part
+        edge_shape = edge.shape
+        if edge_shape.Orientation() == OCC.Core.TopAbs.TopAbs_Orientation.TopAbs_REVERSED:
+            edge_shape = edge_shape.Oriented(OCC.Core.TopAbs.TopAbs_FORWARD)
 
         br_adpt_face = OCC.Core.BRepAdaptor.BRepAdaptor_Surface(face.shape)
-        br_adpt_edge = OCC.Core.BRepAdaptor.BRepAdaptor_Curve(edge.shape)
+        br_adpt_edge = OCC.Core.BRepAdaptor.BRepAdaptor_Curve(edge_shape)
 
         #if br_adpt_edge.GetType() != GeomAbs_Line and not (
         #        br_adpt_edge.GetType() == GeomAbs_BSplineCurve and br_adpt_edge.Degree() == 1):
@@ -82,6 +85,9 @@ class TransformFactory:
             br_adpt_edge.Value(br_adpt_edge.FirstParameter()),
             br_adpt_edge.Value(br_adpt_edge.LastParameter()))
         dx_prime = OCC.Core.gp.gp_Dir(dx_prime)
+
+        if face.shape.Orientation() == OCC.Core.TopAbs.TopAbs_Orientation.TopAbs_REVERSED:
+            dz_prime.Reverse()
 
         if mirror:
             dz_prime.Reverse()

@@ -47,16 +47,21 @@ import OCC.Core.TopTools
 import OCC.Core.TopoDS
 import OCC.Core.gp
 from OCC.Core.NCollection import NCollection_List
+from OCC.Core.TopTools import TopTools_ListIteratorOfListOfShape
 from OCC.Core.gp import gp_Dir
 from OCC.Core.gp import gp_Dir as dir
 from OCC.Core.gp import gp_Pnt
 from OCC.Core.gp import gp_Pnt as pnt
 from OCC.Core.gp import gp_Vec
 from OCC.Core.gp import gp_Vec as vec
+from OCC.Core.gp import gp_XYZ
 
-import util_wrapper_swig
+from util_wrapper_swig import UtilWrapper
 
-from ezocc.type_utils import TypeValidator
+from ezocc.data_structures.deferred_value import DeferredValue
+from ezocc.data_structures.point_like import P3DLike
+from ezocc.humanization import Humanize
+from ezocc.type_utils import TypeValidator, TypeUtils
 
 LOGGER = logging.getLogger("occutils_python")
 
@@ -276,6 +281,58 @@ class WireSketcherEntry:
         self.v1_label = v1_label
 
 
+class RelativePoint:
+
+    DEFERRED_VALUE_INPUTS = typing.Tuple[OCC.Core.TopoDS.TopoDS_Vertex, typing.List[WireSketcherEntry]]
+
+    @staticmethod
+    def ago(offset: int):
+        return RelativePoint(relative_index=-offset)
+
+    @staticmethod
+    def relative(offset: int):
+        return RelativePoint(relative_index=offset)
+
+    @staticmethod
+    def absolute(index: int):
+        return RelativePoint(absolute_index=index)
+
+    def __init__(self,
+                 absolute_index: typing.Optional[int] = None,
+                 relative_index: typing.Optional[int] = None):
+        if ((absolute_index is None and relative_index is None) or
+                (absolute_index is not None and relative_index is not None)):
+            raise ValueError("Either absolute_index or relative_index must be non-null, but not both")
+
+        self._absolute_index = absolute_index
+        self._relative_index = relative_index
+
+    def x(self) -> DeferredValue[DEFERRED_VALUE_INPUTS, float]:
+        return DeferredValue(lambda ws: self.get_point(ws).xyz[0])
+
+    def y(self) -> DeferredValue[DEFERRED_VALUE_INPUTS, float]:
+        return DeferredValue(lambda ws: self.get_point(ws).xyz[1])
+
+    def z(self) -> DeferredValue[DEFERRED_VALUE_INPUTS, float]:
+        return DeferredValue(lambda ws: self.get_point(ws).xyz[2])
+
+    def get_point(self,
+                  sketcher_entries: DEFERRED_VALUE_INPUTS) -> P3DLike:
+
+        verts = [sketcher_entries[0]]
+        for s in sketcher_entries[1]:
+            verts.append(s.v1)
+
+        point_count = len(verts)
+
+        abs_index = self._absolute_index if self._absolute_index is not None else point_count - self._relative_index - 1
+
+        if abs_index < 0 or abs_index >= point_count:
+            raise ValueError(f"Invalid resultant index (index was {abs_index} for a point total of {point_count})")
+
+        return P3DLike.create(verts[abs_index])
+
+
 class WireSketcher:
 
     linespec_reg = re.compile("[xyz]+")
@@ -353,6 +410,60 @@ class WireSketcher:
         lp = self.last_vertex_pnt
 
         return self.line_to(x.get_value(lp.X()), y.get_value(lp.Y()), z.get_value(lp.Z()), is_relative=False)
+
+    NLINE_TO_VALUE_TYPE = typing.Union[float, DeferredValue[RelativePoint.DEFERRED_VALUE_INPUTS, float]]
+
+    def nline_to(self,
+                 x: typing.Optional[NLINE_TO_VALUE_TYPE] = None,
+                 y: typing.Optional[NLINE_TO_VALUE_TYPE] = None,
+                 z: typing.Optional[NLINE_TO_VALUE_TYPE] = None,
+                 dx: typing.Optional[NLINE_TO_VALUE_TYPE] = None,
+                 dy: typing.Optional[NLINE_TO_VALUE_TYPE] = None,
+                 dz: typing.Optional[NLINE_TO_VALUE_TYPE] = None,
+                 label: str = None,
+                 v0_label: str = None,
+                 v1_label: str = None,
+                 tol: float = 0.000001,
+                 fraction: float = 1):
+
+        if x is not None and dx is not None:
+            raise ValueError("x and dx are mutually exclusive parameters")
+
+        if y is not None and dy is not None:
+            raise ValueError("y and dy are mutually exclusive parameters")
+
+        if z is not None and dz is not None:
+            raise ValueError("z and dz are mutually exclusive parameters")
+
+        last_point_pnt = OCC.Core.BRep.BRep_Tool.Pnt(self._last_vertex)
+
+        next_x_coordianate = last_point_pnt.X()
+        next_y_coordianate = last_point_pnt.Y()
+        next_z_coordianate = last_point_pnt.Z()
+
+        if x is not None:
+            next_x_coordianate = x
+        elif dx is not None:
+            next_x_coordianate = dx + last_point_pnt.X()
+
+        if y is not None:
+            next_y_coordianate = y
+        elif dy is not None:
+            next_y_coordianate = dy + last_point_pnt.Y()
+
+        if z is not None:
+            next_z_coordianate = z
+        elif dz is not None:
+            next_z_coordianate = dz + last_point_pnt.Z()
+
+        next_x_coordianate = DeferredValue.of(next_x_coordianate).resolve((self.initial_vertex, self._edges))
+        next_y_coordianate = DeferredValue.of(next_y_coordianate).resolve((self.initial_vertex, self._edges))
+        next_z_coordianate = DeferredValue.of(next_z_coordianate).resolve((self.initial_vertex, self._edges))
+
+        return self.line_to(next_x_coordianate, next_y_coordianate, next_z_coordianate,
+                            is_relative=False,
+                            label=label, v0_label=v0_label, v1_label=v1_label, tol=tol, fraction=fraction)
+
 
     def line_to(self,
                 x: float = None,
@@ -670,7 +781,7 @@ class WireSketcher:
                       radius: float,
                       direction: OCC.Core.gp.gp_Dir,
                       is_relative: bool = False,
-                      shortest_curve: bool = True,
+                      shortest_curve: typing.Optional[bool] = True,
                       label: str = None,
                       v0_label: str = None,
                       v1_label: str = None):
@@ -714,34 +825,44 @@ class WireSketcher:
         ).Edge()
 
         edge_1 = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeEdge(
-            OCC.Core.GC.GC_MakeArcOfCircle(circle, start_point, end_point, True).Value(),
+            OCC.Core.GC.GC_MakeArcOfCircle(circle, start_point, end_point, False).Value(),
             self._last_vertex,
             end_vertex
         ).Edge()
 
-        if InterrogateUtils.length(edge_0) > InterrogateUtils.length(edge_1):
-            max_length_edge = edge_0
-            min_length_edge = edge_1
-        else:
-            max_length_edge = edge_1
-            min_length_edge = edge_0
-
-        if shortest_curve:
+        if shortest_curve is None:
             self._edges.append(WireSketcherEntry(
-                edge=min_length_edge,
+                edge=edge_0,
                 v0=self._last_vertex,
                 v0_label=v0_label,
                 v1_label=v1_label,
                 v1=end_vertex,
                 edge_label=label))
         else:
-            self._edges.append(WireSketcherEntry(
-                edge=max_length_edge,
-                v0=self._last_vertex,
-                v0_label=v0_label,
-                v1_label=v1_label,
-                v1=end_vertex,
-                label=label))
+
+            if InterrogateUtils.length(edge_0) > InterrogateUtils.length(edge_1):
+                max_length_edge = edge_0
+                min_length_edge = edge_1
+            else:
+                max_length_edge = edge_1
+                min_length_edge = edge_0
+
+            if shortest_curve:
+                self._edges.append(WireSketcherEntry(
+                    edge=min_length_edge,
+                    v0=self._last_vertex,
+                    v0_label=v0_label,
+                    v1_label=v1_label,
+                    v1=end_vertex,
+                    edge_label=label))
+            else:
+                self._edges.append(WireSketcherEntry(
+                    edge=max_length_edge,
+                    v0=self._last_vertex,
+                    v0_label=v0_label,
+                    v1_label=v1_label,
+                    v1=end_vertex,
+                    edge_label=label))
 
         self._last_vertex = end_vertex
 
@@ -831,7 +952,7 @@ class WireSketcher:
         if not OCC.Core.BRepLib.breplib.BuildCurves3d(edge):
             raise ValueError("Build curves 3d failed")
 
-        curve = OCC.Core.BRep.BRep_Tool_Curve(edge)[0].Reversed()
+        curve = OCC.Core.BRep.BRep_Tool.Curve(edge)[0].Reversed()
 
         return OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeEdge(curve, start_vertex, end_vertex).Edge()
 
@@ -859,7 +980,7 @@ class WireSketcher:
         if not OCC.Core.BRepLib.breplib.BuildCurves3d(edge):
             raise ValueError("Build curves 3d failed")
 
-        curve = OCC.Core.BRep.BRep_Tool_Curve(edge)[0]
+        curve = OCC.Core.BRep.BRep_Tool.Curve(edge)[0]
 
         edge = OCC.Core.BRepBuilderAPI.BRepBuilderAPI_MakeEdge(curve, start_vertex, end_vertex).Edge()
 
@@ -1096,7 +1217,7 @@ class ListUtils:
 
     @staticmethod
     def iterate_list(shapes: OCC.Core.TopTools.TopTools_ListOfShape):
-        it = OCC.Core.TopoDS.TopoDS_ListIteratorOfListOfShape(shapes)
+        it = OCC.Core.TopTools.TopTools_ListIteratorOfListOfShape(shapes)
         while it.More():
             yield it.Value()
             it.Next()
@@ -1368,6 +1489,23 @@ class ExploreUtils:
         explorer = oc.TopExp.TopExp_Explorer(shape, shape_type)
         while explorer.More():
             s = explorer.Current()
+            if predicate(s):
+                yield s
+
+            explorer.Next()
+
+    @staticmethod
+    def ordered_wire_explore_iterate(
+            shape: oc.TopoDS.TopoDS_Shape,
+            shape_type: oc.TopAbs.TopAbs_ShapeEnum,
+            predicate: typing.Callable[[oc.TopoDS.TopoDS_Shape], bool] = lambda s: True):
+        explorer = OCC.Core.BRepTools.BRepTools_WireExplorer(shape)
+        if shape_type != OCC.Core.TopAbs.TopAbs_EDGE:
+            raise ValueError("Only edge exploration is supported")
+
+        while explorer.More():
+            s = explorer.Current()
+
             if predicate(s):
                 yield s
 
@@ -1737,8 +1875,12 @@ class InterrogateUtils:
                         typing.Tuple[float, float]] = None,
                     resolution: float = 0.0001) -> typing.Tuple[gp_Pnt, gp_Dir]:
 
-        if not isinstance(face, OCC.Core.TopoDS.TopoDS_Face):
+        if face.ShapeType() != OCC.Core.TopAbs.TopAbs_FACE:
             raise ValueError(f"Supplied argument is not a face: {face}")
+
+        if not isinstance(face, OCC.Core.TopoDS.TopoDS_Face):
+            face = TypeUtils.downcast_to_shape_type(face)
+
 
         if uv_mapper is None:
             uv_mapper = lambda umn, umx, vmn, vmx: (umn + (umx - umn) / 2, vmn + (vmx - vmn) / 2)
@@ -1757,6 +1899,11 @@ class InterrogateUtils:
     def is_singleton_compound(shape: OCC.Core.TopoDS.TopoDS_Shape) -> bool:
         return shape.ShapeType() == OCC.Core.TopAbs.TopAbs_COMPOUND and \
                len([s for s in InterrogateUtils.traverse_direct_subshapes(shape)]) == 1
+
+    @staticmethod
+    def is_empty_compound(shape: OCC.Core.TopoDS.TopoDS_Shape) -> bool:
+        return shape.ShapeType() == OCC.Core.TopAbs.TopAbs_COMPOUND and \
+               len([s for s in InterrogateUtils.traverse_direct_subshapes(shape)]) == 0
 
     @staticmethod
     def is_compound_of(shape: OCC.Core.TopoDS.TopoDS_Shape, st: OCC.Core.TopAbs.TopAbs_ShapeEnum) -> bool:
@@ -1803,6 +1950,37 @@ class InterrogateUtils:
             t1)
 
         return t0, t1
+
+    @staticmethod
+    def line_tangent_point(shape: OCC.Core.TopoDS.TopoDS_Edge, parameter: float, is_normalized_parameter: bool = True) -> gp_Vec:
+        adaptor = OCC.Core.BRepAdaptor.BRepAdaptor_Curve(shape)
+
+        if is_normalized_parameter:
+            parameter = adaptor.FirstParameter() + parameter * (adaptor.LastParameter() - adaptor.FirstParameter())
+
+        tangent = OCC.Core.gp.gp_Vec()
+        adaptor.D1(
+            parameter,
+            adaptor.Value(parameter),
+            tangent)
+
+        return tangent
+
+
+    @staticmethod
+    def line_point(shape: OCC.Core.TopoDS.TopoDS_Edge, parameter: float, is_normalized_parameter: bool = True) -> gp_Pnt:
+        adaptor = OCC.Core.BRepAdaptor.BRepAdaptor_Curve(shape)
+
+        if is_normalized_parameter:
+            parameter = adaptor.FirstParameter() + parameter * (adaptor.LastParameter() - adaptor.FirstParameter())
+
+        pnt = OCC.Core.gp.gp_Pnt()
+        adaptor.D0(
+            parameter,
+            pnt)
+
+        return pnt
+
 
     @staticmethod
     def line_tangent_points(shape: OCC.Core.TopoDS.TopoDS_Edge) -> typing.Tuple[gp_Vec, gp_Vec]:
@@ -2009,7 +2187,8 @@ class InterrogateUtils:
     @staticmethod
     def length(shape: OCC.Core.TopoDS.TopoDS_Shape):
         if shape.ShapeType() != OCC.Core.TopAbs.TopAbs_EDGE and shape.ShapeType() != OCC.Core.TopAbs.TopAbs_WIRE:
-            raise ValueError("ShapeType does not have meaningful length.")
+            raise ValueError(f"ShapeType does not have meaningful length "
+                             f"(is a: {Humanize.shape_type(shape.ShapeType())}).")
 
         gprops = OCC.Core.GProp.GProp_GProps()
 
@@ -2636,9 +2815,14 @@ class Align:
         return return_func
 
 
-class SetPlaceableShape:
+class GPUtils:
 
-    UPPER_BOUND = 10000
+    @staticmethod
+    def xyz(vector_like: typing.Union[gp_Pnt, gp_Dir, gp_Vec, gp_XYZ]) -> typing.Tuple[float, float, float]:
+        return vector_like.X(), vector_like.Y(), vector_like.Z()
+
+
+class SetPlaceableShape:
 
     def __init__(self, shape: OCC.Core.TopoDS.TopoDS_Shape):
         TypeValidator.assert_is_any_shape(shape)
@@ -2650,16 +2834,21 @@ class SetPlaceableShape:
         return self._shape
 
     def __str__(self) -> str:
-        return f"SetPlaceableShape(shape_class({str(self._shape)}) shape_hash({str(hash(self))}) shape_id({str(id(self._shape))}) id({id(self)}))"
+        if self.shape.Orientable():
+            orientation_str = f"orientation({Humanize.orientation(self.shape.Orientation())})"
+        else:
+            orientation_str = ""
+
+        return f"SetPlaceableShape(shape_class({str(self._shape)}) shape_hash({str(hash(self))}) shape_id({str(id(self._shape))}) id({id(self)})) {orientation_str}"
 
     def __repr__(self):
         return str(self)
 
     def __hash__(self) -> int:
-        return OCC.Core.TopTools.TopTools_ShapeMapHasher.HashCode(self._shape, SetPlaceableShape.UPPER_BOUND)
+        return UtilWrapper.shape_map_hasher_hash_code(self._shape)
 
     def __eq__(self, other: SetPlaceableShape) -> bool:
-        return OCC.Core.TopTools.TopTools_ShapeMapHasher.IsEqual(self.shape, other.shape)
+        return UtilWrapper.shape_map_hasher_equal(self.shape, other.shape)
 
 
 class SetPlaceablePart:

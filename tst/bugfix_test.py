@@ -1,20 +1,9 @@
 import math
 import unittest
 
-import OCC
-import OCC.Core as occ
-import OCC.Core.BOPAlgo
-import OCC.Core.BRepAlgoAPI
-import OCC.Core.BRepBuilderAPI
-import OCC.Core.BRepFilletAPI
-import OCC.Core.BRepOffsetAPI
-import OCC.Core.BRepPrimAPI
-import OCC.Core.GeomAbs
-import OCC.Core.ShapeUpgrade
-import OCC.Core.TopOpeBRepBuild
-import OCC.Core.gp as gp
+from OCC.Core.gp import gp
 
-import ezocc.occutils_python as op
+from ezocc.occutils_python import SetPlaceablePart, WireSketcher
 from ezocc.part_manager import PartFactory, NoOpPartCache
 
 
@@ -30,8 +19,8 @@ class BugfixTest(unittest.TestCase):
 
         comp = self._factory.compound(p0, p1)
 
-        self.assertEqual(op.SetPlaceablePart(p0), op.SetPlaceablePart(comp.single_subpart("foo")))
-        self.assertEqual(op.SetPlaceablePart(p1), op.SetPlaceablePart(comp.single_subpart("bar")))
+        self.assertEqual(SetPlaceablePart(p0), SetPlaceablePart(comp.single_subpart("foo")))
+        self.assertEqual(SetPlaceablePart(p1), SetPlaceablePart(comp.single_subpart("bar")))
 
     def test_pattern_compound(self):
         part = self._factory.box(1, 1, 1).tr.mv(dx=10)
@@ -59,3 +48,35 @@ class BugfixTest(unittest.TestCase):
             .cleanup()
 
         to_mirror.mirror.x()
+
+    def test_edge_network_overlapping_circles(self):
+        """
+        Contrived example where the definite outer edge check results in ignoring a necessary edge.
+        """
+
+        pulley = (WireSketcher()
+                  .line_to(x=10, z=10, is_relative=True)
+                  .line_to(z=0)
+                  .close()
+                  .get_face_part(self._cache)
+                  .do(lambda p: p.bool.union(p.mirror.z().align().stack_z0(p)))
+                  .alg.project_y().alg.edge_network_to_outer_wire()
+                  .make.face()
+                  .tr.mv(dx=30)
+                  .do(lambda p: p.fillet.fillet2d_verts(1, {p.explore.vertex.get_min(lambda v: v.xts.x_mid)}))
+                  .revol.about(gp.OZ(), math.radians(360))
+                  .cleanup()
+                  .do(
+            lambda p: self._factory.cylinder(p.xts.x_span / 2, p.xts.z_span).align().by("xmidymidzmid", p).bool.cut(p))
+                  .do(lambda p: p.bool.cut(self._factory.cylinder(4, p.xts.z_span).align().by("xmidymidzmid", p))))
+
+        edge_network = self._factory.loft([
+            self._factory.circle(8).align().by("xmaxymid", pulley).tr.mv(dz=-1, dx=-15),
+            self._factory.circle(2.5).align().by("xmidymid", pulley).tr.mv(dx=10)
+        ], is_solid=False).alg.project_z().bool.union()
+
+        self._factory.compound(*[
+            e.tr.mv(dz=i * 1) for i, e in enumerate(edge_network.explore.edge.get())
+        ])
+
+        edge_network.alg.edge_network_to_outer_wire()

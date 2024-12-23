@@ -524,22 +524,6 @@ class SVGPathParser:
         else:
             raise ValueError(f"Unknown command type: {cmd_str}")
 
-#    static void splitVector(const int& chunkSize, std::vector<double> vec, std::function<void(const std::vector<double>&)> consumer) {
-#        if (vec.size() % chunkSize != 0) {
-#            throw std::runtime_error("Vector size is not a multiple of chunksize");
-#        }
-#
-#        for (int i = 0; i < vec.size() / chunkSize; i++) {
-#            std::vector<double> subvector;
-#            for (int index = chunkSize * i; index < chunkSize * (i + 1); index++) {
-#                subvector.push_back(vec[index]);
-#            }
-#
-#            consumer(subvector);
-#        }
-#    }
-#};
-
 
 class SVGTransformParser:
 

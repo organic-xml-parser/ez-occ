@@ -6,6 +6,23 @@ import OCC.Core.TopAbs
 from ezocc import humanization
 from ezocc.humanization import Humanize
 
+class TypeUtils:
+
+    DOWNCAST_METHODS = {
+        OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_VERTEX: OCC.Core.TopoDS.topods.Vertex,
+        OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_EDGE: OCC.Core.TopoDS.topods.Edge,
+        OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_WIRE: OCC.Core.TopoDS.topods.Wire,
+        OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_FACE: OCC.Core.TopoDS.topods.Face,
+        OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_SHELL: OCC.Core.TopoDS.topods.Shell,
+        OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_SOLID: OCC.Core.TopoDS.topods.Solid,
+        OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_COMPSOLID: OCC.Core.TopoDS.topods.CompSolid,
+        OCC.Core.TopAbs.TopAbs_ShapeEnum.TopAbs_COMPOUND: OCC.Core.TopoDS.topods.Compound
+    }
+
+    @staticmethod
+    def downcast_to_shape_type(shape: OCC.Core.TopoDS.TopoDS_Shape) -> OCC.Core.TopoDS.TopoDS_Shape:
+        return TypeUtils.DOWNCAST_METHODS[shape.ShapeType()](shape)
+
 
 class TypeValidator:
 

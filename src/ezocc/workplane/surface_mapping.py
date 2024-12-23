@@ -1,3 +1,4 @@
+import logging
 import math
 import pdb
 
@@ -10,6 +11,8 @@ import OCC.Core.BRepBuilderAPI
 import OCC.Core.GC
 import OCC.Core.BRepLib
 import OCC.Core.GeomLib
+import OCC.Core.ShapeAnalysis
+from OCC.Core import Precision
 from OCC.Core.gp import gp_Trsf2d, gp_Vec2d, gp_GTrsf2d, gp_Ax2d, gp_Pnt2d, gp_Dir2d, gp_Lin2d
 
 from ezocc.occutils_python import WireSketcher
@@ -17,6 +20,8 @@ from ezocc.part_cache import FileBasedPartCache, InMemoryPartCache
 from ezocc.part_manager import Part, PartFactory
 
 from util_wrapper_swig import SurfaceMapperWrapper
+
+logger = logging.getLogger()
 
 class SurfaceMapper:
 
@@ -39,7 +44,7 @@ class SurfaceMapper:
         self._from_surface = OCC.Core.BRepAdaptor.BRepAdaptor_Surface(from_surface.shape)
         self._to_surface = OCC.Core.BRepAdaptor.BRepAdaptor_Surface(to_surface.shape)
 
-    def map_face(self, part: Part):
+    def map_face(self, part: Part) -> Part:
         wires = [self.map_wire(w) for w in part.explore.wire.get()]
 
         outer_wire = wires[0]
@@ -50,16 +55,15 @@ class SurfaceMapper:
             mkf.Add(w.make.wire().shape.Reversed())
 
         return part.perform_make_shape(
-            part.cache_token.mutated("map_face", self._from_surface.Face(), self._to_surface.Face()),
+            part.cache_token.mutated("surface_mapper", "map_face", self._from_surface.Face(), self._to_surface.Face()),
             mkf)
 
-    def map_wire(self, part: Part):
+    def map_wire(self, part: Part) -> Part:
         edges = [self.map_edge(e) for e in part.explore.edge.get()]
 
         return self._factory.compound(*edges).make.wire()
 
-    def map_edge(self, part: Part):
-
+    def map_edge(self, part: Part) -> Part:
         c0_u0, c0_v0 = self._from_surface.FirstUParameter(), self._from_surface.FirstVParameter()
         c0_u1, c0_v1 = self._from_surface.LastUParameter(), self._from_surface.LastVParameter()
 
@@ -109,10 +113,15 @@ class SurfaceMapper:
         mke = SurfaceMapperWrapper.create_make_edge(trimmed_curve, self._to_surface)
 
         return part.perform_make_shape(
-            part.cache_token.mutated("map_edge", self._from_surface.Face(), self._to_surface.Face()),
+            part.cache_token.mutated("surface_mapper", "map_edge", self._from_surface.Face(), self._to_surface.Face()),
             mke
         ).cleanup.build_curves_3d()
 
+    def map_vertex(self, part: Part) -> Part:
+        # todo: there has to be a better way to do this...
+        return self.map_edge(WireSketcher(*part.xts.xyz_mid).line_to(1, is_relative=True)
+                                    .get_wire_part(part.cache_token.get_cache())
+                                    .explore.edge.get_single()).explore.vertex.get()[0]
 
 if __name__ == '__main__':
     cache = InMemoryPartCache() # FileBasedPartCache("/wsp/cache")

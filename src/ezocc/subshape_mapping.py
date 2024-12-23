@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import traceback
 
 import OCC.Core.TopoDS
@@ -15,6 +16,8 @@ T_MKS = typing.Union[
 
 
 class ShapeAttributes:
+
+    logger = logging.getLogger(__name__ + ".ShapeAttributes")
 
     def __init__(self, values: typing.Dict[str, str] = None):
         if values is None:
@@ -54,6 +57,8 @@ class ShapeAttributes:
 
 
 class AnnotatedShape:
+
+    logger = logging.getLogger(__name__ + ".AnnotatedShape")
 
     def __init__(self,
                  shape: typing.Union[OCC.Core.TopoDS.TopoDS_Shape, SetPlaceableShape],
@@ -114,6 +119,8 @@ class SubshapeMap:
     immutability.
     """
 
+    logger = logging.getLogger(__name__ + ".SubshapeMap")
+
     def __init__(self,
                  root_shape: AnnotatedShape,
                  map: typing.Dict[str, typing.Set[AnnotatedShape]] = None):
@@ -123,6 +130,11 @@ class SubshapeMap:
             self._map = SubshapeMap.copy_map(map)
         else:
             self._map: typing.Dict[str, typing.Set[AnnotatedShape]] = dict()
+
+        set_placeable_shape_set = {ss.set_placeable_shape for s in self._map.values() for ss in s}
+
+        if any(len(self.find_annotated_shapes(s)) != 1 for s in set_placeable_shape_set):
+            raise ValueError("Shape set contains ambiguous annotated shapes")
 
     @staticmethod
     def from_single_shape(shape: OCC.Core.TopoDS.TopoDS_Shape):
@@ -148,26 +160,50 @@ class SubshapeMap:
         return self._map
 
     def with_updated_root_shape(self, new_shape: typing.Union[OCC.Core.TopoDS.TopoDS_Shape, AnnotatedShape]) -> SubshapeMap:
+
+        if logging.DEBUG >= SubshapeMap.logger.level:
+            msg = f"updating root shape to: {new_shape}"
+        else:
+            msg = None
+
         if isinstance(new_shape, OCC.Core.TopoDS.TopoDS_Shape):
             new_shape = self._root_shape.with_updated_shape(new_shape)
 
         if not isinstance(new_shape, AnnotatedShape):
             raise ValueError("Expected AnnotatedShape")
 
+        if logging.DEBUG >= SubshapeMap.logger.level:
+            msg += f"\nsubshape map root shape updated\n      {self.root_shape}>{self._map}\n"
+
         new_map = SubshapeMap.copy_map(self._map)
 
         # the root shape refers to itself, this should be updated in the new map
+        changes = []
         for name in new_map.keys():
             existing_shape = [s for s in new_map[name] if s.set_placeable_shape == new_shape.set_placeable_shape]
             if len(existing_shape) != 0:
+                changes.append(f"{existing_shape[0]} -> {new_shape}")
                 new_map[name].remove(existing_shape[0])
                 new_map[name].add(new_shape)
+
+        if logging.DEBUG >= SubshapeMap.logger.level:
+            msg += f"    ----->{new_shape} {new_map}\n{','.join(changes)}\n"
+
+            SubshapeMap.logger.debug(msg)
 
         return SubshapeMap(new_shape, new_map)
 
     def place(self, name: str, shape: AnnotatedShape):
         if not isinstance(shape, AnnotatedShape):
             raise ValueError("Expected annotated shape")
+
+        if logging.DEBUG >= SubshapeMap.logger.level:
+            SubshapeMap.logger.debug(f"Placing annotated shape in subshape map {name}, {shape} -----> {self._map}")
+
+        for s in self._map.values():
+            for ss in s:
+                if ss.set_placeable_shape == shape.set_placeable_shape and ss != shape:
+                    raise ValueError("Inconsistent AnnotatedShape: an AnnotatedShape already exists for this shape")
 
         if name not in self._map:
             self._map[name] = set()
@@ -227,6 +263,22 @@ class SubshapeMap:
                 return True
 
         return False
+
+    def find_annotated_shapes(self, shape: SetPlaceableShape) -> typing.Set[AnnotatedShape]:
+        """
+        Given a shape, finds any named annotated shapes that share the same SetPlaceableShape
+        """
+        result = set()
+
+        if self._root_shape.set_placeable_shape == shape:
+            result.add(self._root_shape)
+
+        for s in self.map.values():
+            for ss in s:
+                if ss.set_placeable_shape == shape:
+                    result.add(ss)
+
+        return result
 
     def items(self) -> typing.Generator[typing.Tuple[str, typing.Set[AnnotatedShape]], None, None]:
         for k, v in self._map.items():
